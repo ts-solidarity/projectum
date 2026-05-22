@@ -15,7 +15,7 @@ Open a folder. Every subfolder becomes a project you can mark done/tested, tag, 
 
 - **Filesystem-backed.** Point at any folder, every subfolder is a project. State lives in a single `.projectum.json` per folder — Git-friendly, sync-friendly, no database.
 - **YouTube playlists with per-video tracking.** Paste a URL, `yt-dlp` fetches the metadata, mark videos done as you watch, write per-video notes.
-- **Three kinds of notes, all Markdown.** Per-project, per-playlist, per-video, plus a global scratchpad tab — each with a live Edit ↔ Preview toggle.
+- **WYSIWYG Markdown in every notes pane.** Headings, bold, italic, inline code, fenced blocks, lists, blockquotes, strikethrough, and links render live as you type — syntax markers stay dim but visible, no separate preview window.
 - **Tags with custom colors** that auto-clean when nothing references them anymore.
 - **Pin & drag-to-reorder** projects and playlists; pinned items always float to the top.
 - **Done + Tested toggles** on projects (green check, blue check). Tested projects render in blue on the sidebar.
@@ -28,7 +28,7 @@ Open a folder. Every subfolder becomes a project you can mark done/tested, tag, 
 |   |   |
 |---|---|
 | **Projects** &nbsp;·&nbsp; tagged, pinned, tested<br>![Projects](docs/screenshots/01-projects.png) | **Playlists** &nbsp;·&nbsp; videos, watched count, per-playlist notes<br>![Playlists](docs/screenshots/02-playlists.png) |
-| **Notes** &nbsp;·&nbsp; folder-level scratchpad with Markdown preview<br>![Notes](docs/screenshots/03-notes-preview.png) | **Command palette** &nbsp;·&nbsp; `Ctrl+K` over everything<br>![Palette](docs/screenshots/04-command-palette.png) |
+| **Notes** &nbsp;·&nbsp; folder-wide scratchpad with live WYSIWYG markdown<br>![Notes](docs/screenshots/03-notes-preview.png) | **Command palette** &nbsp;·&nbsp; `Ctrl+K` over everything<br>![Palette](docs/screenshots/04-command-palette.png) |
 | **Settings** &nbsp;·&nbsp; theme, font family, font size<br>![Settings](docs/screenshots/05-settings.png) | **Light theme** &nbsp;·&nbsp; same app, different palette<br>![Light](docs/screenshots/06-light-theme.png) |
 
 ## Install
@@ -59,7 +59,7 @@ Projectum remembers the last folder you opened, so subsequent launches go straig
 - Each subfolder of the chosen root becomes a row. Mark a project **done** with the green check or **tested** with the blue one. Tested projects show their name in blue.
 - Tags are inline chips. Right-click a chip to recolor it; click the **×** to remove. Filter by tag from the **Tag** chip at the top of the sidebar.
 - Drag rows to reorder; right-click a row → **Pin to top** to make a project sticky.
-- Notes support full Markdown; the **Preview** button toggles a rendered view.
+- Notes support full Markdown rendered live in place — there's no separate preview mode, you just type.
 
 ### Playlists tab
 

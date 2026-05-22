@@ -31,9 +31,9 @@ from .anims import (
 )
 from .widgets import (
     BrandMark, ColorPickerPopup, CommandPalette, CompletionToggle, FlowLayout,
-    FrameWrapper, IconButton, PlaylistRow, ProjectRow, SettingsDialog,
-    SizeRunnable, TagChip, TagEditor, TitleBar, VideoRow, WindowControlButton,
-    make_markdown_pane,
+    FrameWrapper, IconButton, MarkdownHighlighter, PlaylistRow, ProjectRow,
+    SettingsDialog, SizeRunnable, TagChip, TagEditor, TitleBar, VideoRow,
+    WindowControlButton,
 )
 from .youtube import PlaylistFetchRunnable
 
@@ -152,9 +152,6 @@ class MainWindow(QMainWindow):
         self._global_notes_save_timer.setInterval(450)
         self._global_notes_save_timer.timeout.connect(self._save_global_notes)
         self._loading_global_notes = False
-        # Guards re-entrant textChanged firing when we modify char formats
-        # to highlight search matches.
-        self._highlighting_notes = False
 
         self._notes_save_timer = QTimer(self)
         self._notes_save_timer.setSingleShot(True)
@@ -548,21 +545,17 @@ class MainWindow(QMainWindow):
         dv.addWidget(self.tag_palette_wrap)
         dv.addSpacing(20)
 
-        notes_header = QHBoxLayout()
         notes_label = QLabel("NOTES")
         notes_label.setObjectName("sectionLabel")
-        notes_header.addWidget(notes_label)
-        notes_header.addStretch()
+        dv.addWidget(notes_label)
+        dv.addSpacing(8)
 
         self.notes_edit = QTextEdit()
         self.notes_edit.setObjectName("notes")
         self.notes_edit.setPlaceholderText("Write something about this project…")
         self.notes_edit.textChanged.connect(self._on_notes_changed)
-        self.notes_toggle, self.notes_stack, self.notes_preview = make_markdown_pane(self.notes_edit)
-        notes_header.addWidget(self.notes_toggle)
-        dv.addLayout(notes_header)
-        dv.addSpacing(8)
-        dv.addWidget(self.notes_stack, 1)
+        self.notes_highlighter = MarkdownHighlighter(self.notes_edit.document())
+        dv.addWidget(self.notes_edit, 1)
 
         self.detail_stack.addWidget(detail)
         self.detail_stack.setCurrentIndex(0)
@@ -759,11 +752,9 @@ class MainWindow(QMainWindow):
 
         right_col = QVBoxLayout()
         right_col.setSpacing(6)
-        pl_notes_header = QHBoxLayout()
         pl_notes_label = QLabel("PLAYLIST NOTES")
         pl_notes_label.setObjectName("sectionLabel")
-        pl_notes_header.addWidget(pl_notes_label)
-        pl_notes_header.addStretch()
+        right_col.addWidget(pl_notes_label)
 
         self.playlist_notes_edit = QTextEdit()
         self.playlist_notes_edit.setObjectName("notes")
@@ -773,11 +764,10 @@ class MainWindow(QMainWindow):
         self.playlist_notes_edit.textChanged.connect(
             self._on_playlist_notes_changed
         )
-        (self.playlist_notes_toggle, self.playlist_notes_stack,
-         self.playlist_notes_preview) = make_markdown_pane(self.playlist_notes_edit)
-        pl_notes_header.addWidget(self.playlist_notes_toggle)
-        right_col.addLayout(pl_notes_header)
-        right_col.addWidget(self.playlist_notes_stack, 1)
+        self.playlist_notes_highlighter = MarkdownHighlighter(
+            self.playlist_notes_edit.document()
+        )
+        right_col.addWidget(self.playlist_notes_edit, 1)
         header_row.addLayout(right_col, 2)
 
         dv.addLayout(header_row)
@@ -809,22 +799,19 @@ class MainWindow(QMainWindow):
         nw = QVBoxLayout(notes_wrap)
         nw.setContentsMargins(0, 8, 0, 0)
         nw.setSpacing(6)
-        video_notes_header = QHBoxLayout()
         self.video_notes_label = QLabel("NOTES")
         self.video_notes_label.setObjectName("sectionLabel")
-        video_notes_header.addWidget(self.video_notes_label)
-        video_notes_header.addStretch()
+        nw.addWidget(self.video_notes_label)
 
         self.video_notes_edit = QTextEdit()
         self.video_notes_edit.setObjectName("notes")
         self.video_notes_edit.setPlaceholderText("Select a video to write notes…")
         self.video_notes_edit.setEnabled(False)
         self.video_notes_edit.textChanged.connect(self._on_video_notes_changed)
-        (self.video_notes_toggle, self.video_notes_stack,
-         self.video_notes_preview) = make_markdown_pane(self.video_notes_edit)
-        video_notes_header.addWidget(self.video_notes_toggle)
-        nw.addLayout(video_notes_header)
-        nw.addWidget(self.video_notes_stack, 1)
+        self.video_notes_highlighter = MarkdownHighlighter(
+            self.video_notes_edit.document()
+        )
+        nw.addWidget(self.video_notes_edit, 1)
         vsplit.addWidget(notes_wrap)
 
         vsplit.setStretchFactor(0, 3)
@@ -859,6 +846,7 @@ class MainWindow(QMainWindow):
             f"color: {theme.TEXT_MUTED}; font-size: 11px; background: transparent;"
         )
         search_row.addWidget(self.notes_search_count)
+        v.addLayout(search_row)
 
         self.global_notes_edit = QTextEdit()
         self.global_notes_edit.setObjectName("notes")
@@ -866,11 +854,10 @@ class MainWindow(QMainWindow):
         self.global_notes_edit.textChanged.connect(self._on_global_notes_changed)
         # Re-highlight matches after the user types so highlights stay current.
         self.global_notes_edit.textChanged.connect(self._refresh_notes_highlights)
-        (self.global_notes_toggle, self.global_notes_stack,
-         self.global_notes_preview) = make_markdown_pane(self.global_notes_edit)
-        search_row.addWidget(self.global_notes_toggle)
-        v.addLayout(search_row)
-        v.addWidget(self.global_notes_stack, 1)
+        self.global_notes_highlighter = MarkdownHighlighter(
+            self.global_notes_edit.document()
+        )
+        v.addWidget(self.global_notes_edit, 1)
 
         # Cached search state.
         self._notes_match_count = 0
@@ -890,40 +877,38 @@ class MainWindow(QMainWindow):
             self._notes_search_seek(forward=True, from_start=True)
 
     def _refresh_notes_highlights(self) -> None:
-        """Highlight all matches of the search query inside the notes editor."""
-        if self._highlighting_notes:
-            return
+        """Highlight all matches of the search query inside the notes editor.
+
+        Uses ``QTextEdit.setExtraSelections`` rather than modifying the
+        document's char formats — that way the search overlay coexists
+        with the live Markdown highlighter instead of fighting it for
+        ownership of each character's format.
+        """
         from PySide6.QtGui import QTextCharFormat, QColor, QTextCursor
+        from PySide6.QtWidgets import QTextEdit
         if not hasattr(self, "notes_search_input") or not hasattr(self, "global_notes_edit"):
             return
         query = self.notes_search_input.text()
-        self._highlighting_notes = True
-        try:
+        selections: list[QTextEdit.ExtraSelection] = []
+        count = 0
+        if query.strip():
+            hl_fmt = QTextCharFormat()
+            bg = QColor(theme.ACCENT)
+            bg.setAlpha(95)
+            hl_fmt.setBackground(bg)
             doc = self.global_notes_edit.document()
-            # Clear previous highlights by re-applying default char format
-            # across the whole doc (cheap, idempotent).
-            cur = QTextCursor(doc)
-            cur.select(QTextCursor.SelectionType.Document)
-            clear_fmt = QTextCharFormat()
-            cur.setCharFormat(clear_fmt)
-            cur.clearSelection()
-            count = 0
-            if query.strip():
-                hl = QTextCharFormat()
-                base = QColor(theme.ACCENT)
-                base.setAlpha(85)
-                hl.setBackground(base)
-                hl.setForeground(QColor(theme.TEXT))
-                search_cursor = QTextCursor(doc)
-                while True:
-                    search_cursor = doc.find(query, search_cursor)
-                    if search_cursor.isNull():
-                        break
-                    search_cursor.mergeCharFormat(hl)
-                    count += 1
-            self._notes_match_count = count
-        finally:
-            self._highlighting_notes = False
+            cursor = QTextCursor(doc)
+            while True:
+                cursor = doc.find(query, cursor)
+                if cursor.isNull():
+                    break
+                sel = QTextEdit.ExtraSelection()
+                sel.cursor = cursor
+                sel.format = hl_fmt
+                selections.append(sel)
+                count += 1
+        self.global_notes_edit.setExtraSelections(selections)
+        self._notes_match_count = count
         if hasattr(self, "notes_search_count"):
             self.notes_search_count.setText(
                 f"{count} match{'es' if count != 1 else ''}" if query.strip() else ""
@@ -1596,9 +1581,6 @@ class MainWindow(QMainWindow):
             self._update_row_notes(self.current_project.name, has_notes)
 
     def _on_global_notes_changed(self) -> None:
-        # Format changes (highlight refresh) also fire textChanged — ignore.
-        if self._highlighting_notes:
-            return
         if self._loading_global_notes or not self.store:
             return
         self._global_notes_save_timer.start()
@@ -2468,6 +2450,16 @@ class MainWindow(QMainWindow):
         # Repaint custom-painted widgets that read theme.* dynamically.
         self._brand_mark.update()
         self._settings_btn.update()
+
+        # Refresh every markdown highlighter so heading sizes and colors
+        # follow the new theme / font.
+        for attr in (
+            "notes_highlighter", "playlist_notes_highlighter",
+            "video_notes_highlighter", "global_notes_highlighter",
+        ):
+            hl = getattr(self, attr, None)
+            if hl is not None:
+                hl.refresh()
 
         # Row widgets and detail panels bake some colors into setStyleSheet
         # calls during their __init__; rebuild the lists and re-load the

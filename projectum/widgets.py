@@ -11,6 +11,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QPainter, QColor, QBrush, QPen, QFont, QPainterPath, QMouseEvent,
+    QSyntaxHighlighter, QTextCharFormat,
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QVBoxLayout, QGridLayout, QLabel,
@@ -1352,46 +1353,221 @@ class CommandPalette(QWidget):
         super().focusOutEvent(event)
 
 
-# ──────────────── Markdown preview helper ────────────────
+# ──────────────── WYSIWYG markdown highlighter ────────────────
 
 
-def make_markdown_pane(editor):
-    """Wrap a notes editor with an Edit/Preview toggle button + stacked preview.
+import re as _re
 
-    Returns ``(toggle_button, stack, preview)``. The caller places the toggle
-    in a header row and adds the stack to the main layout in the editor's
-    former position. Preview uses Qt's built-in ``QTextDocument.setMarkdown``
-    and re-syncs on every editor text change while preview mode is active.
+
+class MarkdownHighlighter(QSyntaxHighlighter):
+    """Live markdown formatting inside any QTextEdit's document.
+
+    Headings get larger and bold, ``**bold**`` renders bold, ``*italic*``
+    italic, fenced code blocks get a monospace background, etc. The
+    syntax markers (``#``, ``**``, backticks…) stay in the text — just
+    dimmed — so the document is still raw editable Markdown.
+
+    Formats are rebuilt lazily when the active theme or font size
+    changes so the appearance always matches the rest of the app.
     """
-    from PySide6.QtWidgets import QStackedWidget, QTextBrowser
-    preview = QTextBrowser()
-    preview.setObjectName("notes")
-    preview.setOpenExternalLinks(True)
-    stack = QStackedWidget()
-    stack.addWidget(editor)
-    stack.addWidget(preview)
-    toggle = QPushButton("Preview")
-    toggle.setObjectName("ghost")
-    toggle.setCheckable(True)
-    toggle.setCursor(Qt.CursorShape.PointingHandCursor)
-    toggle.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
-    def _sync_preview():
-        if toggle.isChecked():
-            preview.setMarkdown(editor.toPlainText())
+    HEADING_RE = _re.compile(r"^(\s*)(#{1,6})\s+")
+    BOLD_RE = _re.compile(r"\*\*([^*\n][^\n]*?)\*\*")
+    UNDERSCORE_BOLD_RE = _re.compile(r"__([^_\n][^\n]*?)__")
+    ITALIC_RE = _re.compile(r"(?<![\*\w])\*([^*\n]+?)\*(?!\*)")
+    UNDERSCORE_ITALIC_RE = _re.compile(r"(?<![_\w])_([^_\n]+?)_(?!_)")
+    INLINE_CODE_RE = _re.compile(r"`([^`\n]+)`")
+    STRIKE_RE = _re.compile(r"~~([^~\n]+?)~~")
+    LINK_RE = _re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
+    LIST_RE = _re.compile(r"^(\s*)([-*+]|\d+\.)\s")
+    QUOTE_RE = _re.compile(r"^(\s*>+\s?)")
+    HR_RE = _re.compile(r"^\s*([-*_])(?:\s*\1){2,}\s*$")
+    FENCE_RE = _re.compile(r"^\s*```")
 
-    def _on_toggle(checked):
-        if checked:
-            preview.setMarkdown(editor.toPlainText())
-            stack.setCurrentWidget(preview)
-            toggle.setText("Edit")
-        else:
-            stack.setCurrentWidget(editor)
-            toggle.setText("Preview")
+    STATE_NONE = 0
+    STATE_CODE = 1
 
-    toggle.clicked.connect(_on_toggle)
-    editor.textChanged.connect(_sync_preview)
-    return toggle, stack, preview
+    def __init__(self, document):
+        super().__init__(document)
+        self._cached_theme = None
+        self._cached_size = None
+        self._build_formats()
+
+    def _build_formats(self) -> None:
+        # Imported lazily so this module stays import-safe at startup.
+        from .theme import (
+            ACCENT, ACCENT_2, SURFACE_2, TEXT, TEXT_DIM, TEXT_MUTED,
+            current_font_size, current_theme_name,
+        )
+        self._cached_theme = current_theme_name()
+        self._cached_size = current_font_size()
+        # Editor's #notes rule uses base_size+1; match that as our root.
+        base = max(self._cached_size + 1, 12)
+
+        def fmt() -> QTextCharFormat:
+            return QTextCharFormat()
+
+        # Headings — relative scale from base.
+        scales = [1.85, 1.55, 1.30, 1.15, 1.05, 1.0]
+        self._headings: list[QTextCharFormat] = []
+        for s in scales:
+            f = fmt()
+            f.setFontPointSize(round(base * s))
+            f.setFontWeight(QFont.Weight.Bold)
+            f.setForeground(QColor(TEXT))
+            self._headings.append(f)
+
+        self._bold = fmt()
+        self._bold.setFontWeight(QFont.Weight.Bold)
+
+        self._italic = fmt()
+        self._italic.setFontItalic(True)
+
+        self._bold_italic = fmt()
+        self._bold_italic.setFontWeight(QFont.Weight.Bold)
+        self._bold_italic.setFontItalic(True)
+
+        self._inline_code = fmt()
+        self._inline_code.setFontFamilies(
+            ["JetBrains Mono", "Fira Code", "DejaVu Sans Mono", "monospace"]
+        )
+        self._inline_code.setBackground(QColor(SURFACE_2))
+        self._inline_code.setForeground(QColor(ACCENT_2))
+
+        self._code_block = fmt()
+        self._code_block.setFontFamilies(
+            ["JetBrains Mono", "Fira Code", "DejaVu Sans Mono", "monospace"]
+        )
+        self._code_block.setBackground(QColor(SURFACE_2))
+        self._code_block.setForeground(QColor(TEXT_DIM))
+
+        self._strike = fmt()
+        self._strike.setFontStrikeOut(True)
+        self._strike.setForeground(QColor(TEXT_MUTED))
+
+        self._link = fmt()
+        self._link.setForeground(QColor(ACCENT))
+        self._link.setFontUnderline(True)
+
+        self._quote = fmt()
+        self._quote.setForeground(QColor(TEXT_DIM))
+        self._quote.setFontItalic(True)
+
+        # Dim color for the markers themselves (the `#`, `**`, `[]()`…).
+        self._marker = fmt()
+        self._marker.setForeground(QColor(TEXT_MUTED))
+
+        self._hr = fmt()
+        self._hr.setForeground(QColor(TEXT_MUTED))
+
+    def _maybe_rebuild(self) -> None:
+        from .theme import current_font_size, current_theme_name
+        if (self._cached_theme != current_theme_name()
+                or self._cached_size != current_font_size()):
+            self._build_formats()
+
+    def refresh(self) -> None:
+        """Rebuild formats and re-highlight every block.
+
+        Call after a theme or font change so colors and heading sizes
+        match the new settings.
+        """
+        self._build_formats()
+        self.rehighlight()
+
+    def highlightBlock(self, text: str) -> None:
+        self._maybe_rebuild()
+
+        # ───── Fenced code blocks (multi-line) ─────
+        prev = self.previousBlockState()
+        in_code = (prev == self.STATE_CODE)
+        if self.FENCE_RE.match(text):
+            self.setFormat(0, len(text), self._code_block)
+            # Toggle the state for the next block.
+            self.setCurrentBlockState(
+                self.STATE_NONE if in_code else self.STATE_CODE
+            )
+            return
+        if in_code:
+            self.setFormat(0, len(text), self._code_block)
+            self.setCurrentBlockState(self.STATE_CODE)
+            return
+        self.setCurrentBlockState(self.STATE_NONE)
+
+        # ───── Horizontal rule ─────
+        if self.HR_RE.match(text):
+            self.setFormat(0, len(text), self._hr)
+            return
+
+        # ───── Heading ─────
+        m = self.HEADING_RE.match(text)
+        if m:
+            level = len(m.group(2))
+            self.setFormat(0, len(text), self._headings[level - 1])
+            # Dim the leading `#`s + the space after them.
+            self.setFormat(m.start(2), len(m.group(2)) + 1, self._marker)
+            # Inline patterns can still apply inside the heading body.
+            self._apply_inline(text, skip_marker_dimming=True)
+            return
+
+        # ───── Blockquote ─────
+        m = self.QUOTE_RE.match(text)
+        if m:
+            self.setFormat(0, len(text), self._quote)
+            self.setFormat(0, len(m.group(0)), self._marker)
+            # Fall through so inline patterns still work inside the quote.
+
+        # ───── List marker ─────
+        m = self.LIST_RE.match(text)
+        if m:
+            self.setFormat(
+                len(m.group(1)), len(m.group(2)) + 1, self._marker
+            )
+
+        self._apply_inline(text)
+
+    def _apply_inline(self, text: str, *, skip_marker_dimming: bool = False) -> None:
+        # Inline code first so its background/foreground claim its range
+        # before bold/italic could overwrite parts of the same span.
+        for m in self.INLINE_CODE_RE.finditer(text):
+            self.setFormat(m.start(), m.end() - m.start(), self._inline_code)
+
+        for m in self.BOLD_RE.finditer(text):
+            self.setFormat(m.start(), m.end() - m.start(), self._bold)
+            if not skip_marker_dimming:
+                self.setFormat(m.start(), 2, self._marker)
+                self.setFormat(m.end() - 2, 2, self._marker)
+        for m in self.UNDERSCORE_BOLD_RE.finditer(text):
+            self.setFormat(m.start(), m.end() - m.start(), self._bold)
+            if not skip_marker_dimming:
+                self.setFormat(m.start(), 2, self._marker)
+                self.setFormat(m.end() - 2, 2, self._marker)
+
+        for m in self.ITALIC_RE.finditer(text):
+            self.setFormat(m.start(), m.end() - m.start(), self._italic)
+            if not skip_marker_dimming:
+                self.setFormat(m.start(), 1, self._marker)
+                self.setFormat(m.end() - 1, 1, self._marker)
+        for m in self.UNDERSCORE_ITALIC_RE.finditer(text):
+            self.setFormat(m.start(), m.end() - m.start(), self._italic)
+            if not skip_marker_dimming:
+                self.setFormat(m.start(), 1, self._marker)
+                self.setFormat(m.end() - 1, 1, self._marker)
+
+        for m in self.STRIKE_RE.finditer(text):
+            self.setFormat(m.start(), m.end() - m.start(), self._strike)
+            if not skip_marker_dimming:
+                self.setFormat(m.start(), 2, self._marker)
+                self.setFormat(m.end() - 2, 2, self._marker)
+
+        for m in self.LINK_RE.finditer(text):
+            # `[label]`
+            label_end = m.start() + 1 + len(m.group(1))  # past the closing ]
+            self.setFormat(m.start() + 1, len(m.group(1)), self._link)
+            if not skip_marker_dimming:
+                # Dim everything except the visible label text.
+                self.setFormat(m.start(), 1, self._marker)            # [
+                self.setFormat(label_end, m.end() - label_end, self._marker)  # ](url)
 
 
 # ──────────────── Playlists ────────────────
