@@ -2,7 +2,7 @@
 
 # Projectum
 
-**A keyboard-first desktop tracker for the projects, playlists, and notes that live in a folder on your disk.**
+**A keyboard-first desktop tracker for the projects, playlists, tasks, and notes that live in a folder on your disk.**
 
 [![CI](https://github.com/ts-solidarity/projectum/actions/workflows/ci.yml/badge.svg)](https://github.com/ts-solidarity/projectum/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/ts-solidarity/projectum?sort=semver)](https://github.com/ts-solidarity/projectum/releases/latest)
@@ -21,7 +21,7 @@ No servers. No accounts. No telemetry. Your data is one JSON file next to your w
 
 ## What it is
 
-Point Projectum at a folder and **every subfolder becomes a project** you can mark *done* and *tested*, tag with colors, annotate with live‑rendered Markdown, pin, and reorder. The same window tracks **YouTube playlists** — titles, durations, watched state, and per‑video notes via [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) — and keeps a **folder‑wide scratchpad**. A `Ctrl+K` command palette searches across all of it.
+Point Projectum at a folder and **every subfolder becomes a project** you can mark *done* and *tested*, tag with colors, annotate with live‑rendered Markdown, pin, and reorder. The same window tracks **YouTube playlists** — titles, durations, watched state, and per‑video notes via [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) — keeps a **to‑do list** and a **folder‑wide scratchpad**. A `Ctrl+K` command palette searches across all of it.
 
 Everything for a folder is stored in a single, human‑readable `.projectum.json` inside it — so it travels with your work, diffs cleanly in Git, and is trivial to back up or delete.
 
@@ -59,6 +59,7 @@ Projectum remembers the last folder you opened, so later launches go straight ba
 - **Filesystem‑backed projects.** Any folder works; each subfolder is a project. State lives in one `.projectum.json` per folder — Git‑friendly, sync‑friendly, no database.
 - **YouTube playlists with per‑video tracking.** Paste a URL, `yt-dlp` fetches the metadata, tick videos off as you watch, and keep notes per video. *Refresh* later pulls in new uploads while preserving your progress; videos removed upstream are kept and flagged.
 - **Live WYSIWYG Markdown** in every notes pane. Headings, bold/italic, inline and fenced code, lists, blockquotes, strikethrough, and links render as you type — the syntax markers stay dimmed but present, so it's still plain editable Markdown with no separate preview.
+- **A folder-scoped Todo list** — quick tasks per folder: add, check off, double‑click to edit inline, delete, and drag to reorder, with a done/total counter.
 - **Tags with custom colors** (right‑click any chip), an automatic cleanup that drops unused colors, and a sidebar tag filter.
 - **Done + Tested toggles** per project — a green check and a blue one; tested projects render in blue in the sidebar.
 - **Pin & drag‑to‑reorder** projects and playlists; pinned items float to the top.
@@ -80,6 +81,8 @@ Projectum remembers the last folder you opened, so later launches go straight ba
 **Projects** — Each subfolder of the chosen root is a row. Toggle **done** (green) or **tested** (blue); tested projects show their name in blue. Tags are inline chips — right‑click to recolor, click the **×** to remove, and filter by tag from the **Tag** chip at the top of the sidebar. Drag rows to reorder, or right‑click → **Pin to top**. The notes editor renders Markdown live, in place.
 
 **Playlists** — **+ Add YouTube playlist** prompts for a URL; `yt-dlp` fetches the title, uploader, and every video. **Refresh** re‑syncs while keeping your watched/notes state. Tag, pin, reorder, and write per‑playlist notes; each video has its own notes pane below the list.
+
+**Todo** — A folder‑scoped task list. Type a task and press Enter to add it; tick the toggle to complete it (it strikes through), double‑click the text to edit inline, drag to reorder, and use the **×** to delete. A counter shows how many are done.
 
 **Notes** — A single, folder‑wide scratchpad with live WYSIWYG Markdown and a search bar (`↵` / `Shift+↵` to jump between matches).
 

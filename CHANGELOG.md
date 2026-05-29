@@ -3,6 +3,18 @@
 All notable changes to Projectum are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] — 2026-05-30
+
+### Added
+
+- **Todo tab** — a folder-scoped to-do list beside Projects, Playlists, and Notes. Add tasks (Enter), check them off, double-click to edit inline, delete, and drag to reorder; a done/total counter and an empty state round it out. Tasks persist in the folder's `.projectum.json` and are searchable from the `Ctrl+K` command palette.
+
+### Changed
+
+- **Smooth mouse-wheel scrolling** rebuilt as a single continuous glide toward an accumulating target, eased with frame-rate-independent damping, replacing the per-notch ease-out that decelerated from a standstill on every notch and stuttered on fast spins. Trackpad / high-precision scrolling continues to use the native low-latency path.
+
+[1.2.0]: https://github.com/ts-solidarity/projectum/releases/tag/v1.2.0
+
 ## [1.1.0] — 2026-05-29
 
 A large correctness, performance, and distribution release. Adds a self‑contained Linux AppImage, replaces the Markdown preview toggle with a live WYSIWYG highlighter, and fixes a broad set of data‑loss, crash, and smoothness issues found in an exhaustive review.
