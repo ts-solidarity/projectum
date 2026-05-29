@@ -34,8 +34,8 @@ from .anims import (
 from .widgets import (
     BrandMark, ColorPickerPopup, CommandPalette, CompletionToggle, FlowLayout,
     FrameWrapper, IconButton, MarkdownHighlighter, PlaylistRow, ProjectRow,
-    SettingsDialog, SizeRunnable, TagChip, TagEditor, TitleBar, VideoRow,
-    WindowControlButton,
+    SettingsDialog, SizeRunnable, TagChip, TagEditor, TitleBar, TodoRow,
+    VideoRow, WindowControlButton,
 )
 from .youtube import PlaylistFetchRunnable
 
@@ -135,6 +135,7 @@ class MainWindow(QMainWindow):
         self._loading_video_details = False
         self._playlist_items: dict[str, QListWidgetItem] = {}
         self._video_items: dict[str, QListWidgetItem] = {}
+        self._todo_items: dict[str, QListWidgetItem] = {}
         self._playlist_url_input: QLineEdit | None = None
         self._playlist_tag_editor: TagEditor | None = None
         self._pending_fetches: dict[str, tuple[object, object]] = {}
@@ -198,6 +199,7 @@ class MainWindow(QMainWindow):
             self.list_widget,
             self.playlists_list_widget,
             self.video_list_widget,
+            self.todo_list_widget,
             self.notes_edit,
             self.playlist_notes_edit,
             self.video_notes_edit,
@@ -360,9 +362,11 @@ class MainWindow(QMainWindow):
         self.content_stack = QStackedWidget()
         self.projects_view = self._build_projects_view()
         self.playlists_view = self._build_playlists_view()
+        self.todo_view = self._build_todo_view()
         self.notes_view = self._build_notes_view()
         self.content_stack.addWidget(self.projects_view)
         self.content_stack.addWidget(self.playlists_view)
+        self.content_stack.addWidget(self.todo_view)
         self.content_stack.addWidget(self.notes_view)
         v.addWidget(self.content_stack, 1)
 
@@ -382,6 +386,7 @@ class MainWindow(QMainWindow):
         for key, label in [
             ("projects", "Projects"),
             ("playlists", "Playlists"),
+            ("todos", "Todo"),
             ("notes", "Notes"),
         ]:
             b = QPushButton(label)
@@ -405,6 +410,7 @@ class MainWindow(QMainWindow):
         target = {
             "projects": self.projects_view,
             "playlists": self.playlists_view,
+            "todos": self.todo_view,
             "notes": self.notes_view,
         }.get(key, self.projects_view)
         cross_fade_stack(
@@ -899,6 +905,186 @@ class MainWindow(QMainWindow):
         prev_sc.setContext(Qt.ShortcutContext.WidgetShortcut)
         return container
 
+    # ─── Todo view ───────────────────────────────────────────────
+
+    def _build_todo_view(self) -> QWidget:
+        container = QWidget()
+        container.setObjectName("detailPanel")
+        v = QVBoxLayout(container)
+        v.setContentsMargins(36, 26, 36, 24)
+        v.setSpacing(12)
+
+        header = QHBoxLayout()
+        title = QLabel("TODO")
+        title.setObjectName("sectionLabel")
+        header.addWidget(title)
+        header.addStretch()
+        self.todo_counter = QLabel("")
+        self.todo_counter.setObjectName("subtitle")
+        header.addWidget(self.todo_counter)
+        v.addLayout(header)
+
+        self.todo_input = QLineEdit()
+        self.todo_input.setPlaceholderText("Add a task — press Enter")
+        self.todo_input.setClearButtonEnabled(True)
+        self.todo_input.returnPressed.connect(self._add_todo)
+        v.addWidget(self.todo_input)
+
+        self.todo_list_widget = QListWidget()
+        self.todo_list_widget.setVerticalScrollMode(
+            QListWidget.ScrollMode.ScrollPerPixel
+        )
+        self.todo_list_widget.setUniformItemSizes(False)
+        self.todo_list_widget.setFrameShape(QListWidget.Shape.NoFrame)
+        self.todo_list_widget.setDragDropMode(
+            QListWidget.DragDropMode.InternalMove
+        )
+        self.todo_list_widget.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.todo_list_widget.model().rowsMoved.connect(self._persist_todo_order)
+        v.addWidget(self.todo_list_widget, 1)
+
+        self.todo_empty_hint = QLabel(
+            "No tasks yet.\nAdd one above to get started."
+        )
+        self.todo_empty_hint.setObjectName("emptyHint")
+        self.todo_empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(self.todo_empty_hint, 1)
+        return container
+
+    def _rebuild_todo_list(self) -> None:
+        self.todo_list_widget.blockSignals(True)
+        self.todo_list_widget.clear()
+        self._todo_items.clear()
+        if self.store:
+            for todo in self.store.sorted_todos():
+                self._append_todo_row(todo)
+        self.todo_list_widget.blockSignals(False)
+        self._update_todo_counter()
+        self._update_todo_empty_hint()
+
+    def _make_todo_row(self, todo) -> TodoRow:
+        row = TodoRow(todo)
+        row.toggled.connect(
+            lambda checked, tid=todo.id: self._on_todo_toggled(tid, checked)
+        )
+        row.remove_clicked.connect(lambda tid=todo.id: self._remove_todo(tid))
+        row.edited.connect(
+            lambda text, tid=todo.id: self._on_todo_edited(tid, text)
+        )
+        return row
+
+    def _append_todo_row(self, todo) -> QListWidgetItem:
+        row = self._make_todo_row(todo)
+        item = QListWidgetItem()
+        item.setData(Qt.ItemDataRole.UserRole, todo.id)
+        item.setSizeHint(QSize(0, row.sizeHint().height()))
+        self.todo_list_widget.addItem(item)
+        self.todo_list_widget.setItemWidget(item, row)
+        self._todo_items[todo.id] = item
+        return item
+
+    def _add_todo(self) -> None:
+        if not self.store:
+            return
+        text = self.todo_input.text().strip()
+        if not text:
+            return
+        todo = self.store.add_todo(text)
+        self.todo_input.clear()
+        self._append_todo_row(todo)
+        self._update_todo_counter()
+        self._update_todo_empty_hint()
+        item = self._todo_items.get(todo.id)
+        if item is not None:
+            self.todo_list_widget.scrollToItem(item)
+
+    def _on_todo_toggled(self, todo_id: str, checked: bool) -> None:
+        if not self.store:
+            return
+        todo = self.store.get_todo(todo_id)
+        if todo is None:
+            return
+        todo.done = checked
+        self.store.save()
+        self._update_todo_counter()
+
+    def _remove_todo(self, todo_id: str) -> None:
+        if not self.store:
+            return
+        self.store.remove_todo(todo_id)
+        item = self._todo_items.pop(todo_id, None)
+
+        def _drop():
+            if item is None:
+                return
+            row = self.todo_list_widget.row(item)
+            if row >= 0:
+                self.todo_list_widget.takeItem(row)
+            self._update_todo_empty_hint()
+
+        if item is not None:
+            collapse_list_item(
+                self.todo_list_widget, item, duration=200, on_done=_drop
+            )
+        else:
+            self._update_todo_empty_hint()
+        self._update_todo_counter()
+
+    def _on_todo_edited(self, todo_id: str, text: str) -> None:
+        if not self.store:
+            return
+        todo = self.store.get_todo(todo_id)
+        if todo is None:
+            return
+        todo.text = text
+        self.store.save()
+        # Word-wrap may have changed the row height.
+        item = self._todo_items.get(todo_id)
+        if item is not None:
+            row = self.todo_list_widget.itemWidget(item)
+            if isinstance(row, TodoRow):
+                self._resize_row_deferred(item, row)
+
+    def _persist_todo_order(self, *_args) -> None:
+        if not self.store:
+            return
+        # InternalMove drops the moved row's widget and invalidates cached
+        # item pointers — reconcile (deferred) like projects/playlists.
+        QTimer.singleShot(0, self._reconcile_todo_rows_after_move)
+
+    def _reconcile_todo_rows_after_move(self) -> None:
+        if not self.store:
+            return
+        self._todo_items.clear()
+        ids: list[str] = []
+        for row in range(self.todo_list_widget.count()):
+            it = self.todo_list_widget.item(row)
+            if it is None:
+                continue
+            tid = it.data(Qt.ItemDataRole.UserRole)
+            ids.append(tid)
+            self._todo_items[tid] = it
+            if self.todo_list_widget.itemWidget(it) is None:
+                todo = self.store.get_todo(tid)
+                if todo is not None:
+                    row_w = self._make_todo_row(todo)
+                    it.setSizeHint(QSize(0, row_w.sizeHint().height()))
+                    self.todo_list_widget.setItemWidget(it, row_w)
+        self.store.reorder_todos(ids)
+        self.store.save()
+
+    def _update_todo_counter(self) -> None:
+        if not self.store:
+            self.todo_counter.setText("")
+            return
+        done, total = self.store.todo_stats()
+        self.todo_counter.setText(f"{done} of {total} done" if total else "")
+
+    def _update_todo_empty_hint(self) -> None:
+        empty = not self.store or not self.store.todos
+        self.todo_empty_hint.setVisible(empty)
+        self.todo_list_widget.setVisible(not empty)
+
     def _on_notes_search_changed(self, _text: str) -> None:
         self._refresh_notes_highlights()
         # Jump to the first match so the user sees something immediately.
@@ -1095,6 +1281,8 @@ class MainWindow(QMainWindow):
         self._full_rebuild_list()
         self._update_stats()
         self._rebuild_playlists_list()
+        self.todo_input.clear()
+        self._rebuild_todo_list()
         # Load the folder-level scratchpad. Guard so setPlainText doesn't
         # trip the debounced save back into the freshly-loaded store.
         self._loading_global_notes = True
@@ -1132,6 +1320,7 @@ class MainWindow(QMainWindow):
             return
         self._full_rebuild_list(preserve_name=cur_name)
         self._rebuild_playlists_list()
+        self._rebuild_todo_list()
         self._update_stats()
 
     def _project_snapshot(self) -> tuple:
@@ -1153,7 +1342,10 @@ class MainWindow(QMainWindow):
             )
             for pl in self.store.playlists
         )
-        return (projects, playlists)
+        todos = tuple(
+            (t.id, t.text, t.done, t.position) for t in self.store.todos
+        )
+        return (projects, playlists, todos)
 
     # ─── Listing ─────────────────────────────────────────────────
 
@@ -2571,6 +2763,19 @@ class MainWindow(QMainWindow):
                             "_key": (pl.id, v.id),
                         })
 
+        # Todos — only when there's a query.
+        if q:
+            for todo in self.store.sorted_todos():
+                text = todo.text.strip()
+                if text and q in text.casefold():
+                    results.append({
+                        "type": "todo",
+                        "label": text,
+                        "sublabel": "done" if todo.done else "task",
+                        "_score": score(text),
+                        "_key": todo.id,
+                    })
+
         # Tags.
         if q:
             for t in self.store.all_tags():
@@ -2643,6 +2848,11 @@ class MainWindow(QMainWindow):
         elif kind == "tag":
             self._goto_tab("projects")
             self._set_tag_filter(key)
+        elif kind == "todo":
+            self._goto_tab("todos")
+            it = self._todo_items.get(key)
+            if it is not None:
+                self.todo_list_widget.scrollToItem(it)
         elif kind == "notes":
             self._goto_tab("notes")
             self.notes_search_input.setText(key)
@@ -2744,6 +2954,7 @@ class MainWindow(QMainWindow):
             )
             self._full_rebuild_list(preserve_name=cur_proj_name)
             self._rebuild_playlists_list()
+            self._rebuild_todo_list()  # rows bake theme colors inline
             # _full_rebuild_list reselects the visible row, which fires
             # _on_select -> _load_detail; only reload here if the row is
             # filtered out (so reselection didn't happen), to avoid a

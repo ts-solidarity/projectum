@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 from PySide6.QtCore import (
-    Qt, QRect, QRectF, QPointF, QPoint, Property, Signal, QObject,
+    Qt, QRect, QRectF, QPointF, QPoint, Property, Signal, QObject, QEvent,
     QRunnable, QSize,
 )
 from PySide6.QtGui import (
@@ -1333,6 +1333,7 @@ class CommandPalette(QWidget):
             "playlist": "Playlist",
             "video": "Video",
             "tag": "Tag",
+            "todo": "Todo",
             "notes": "Notes",
         }.get(r.get("type", ""), "?")
         label = r.get("label", "")
@@ -1837,3 +1838,145 @@ class VideoRow(QWidget):
 
     def set_has_notes(self, has: bool) -> None:
         self.notes_dot.setVisible(has)
+
+
+# ──────────────── Todo row ────────────────
+
+
+class TodoRow(QWidget):
+    """One task in the Todo tab: a completion toggle, the text (double-click to
+    edit inline), and a delete button."""
+
+    toggled = Signal(bool)
+    remove_clicked = Signal()
+    edited = Signal(str)
+
+    def __init__(self, todo, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.todo = todo
+        self._editing = False
+        self._build()
+
+    def _build(self) -> None:
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 9, 8, 9)
+        layout.setSpacing(12)
+
+        self.toggle = CompletionToggle(self.todo.done)
+        self.toggle.toggled.connect(self._on_toggle)
+        layout.addWidget(self.toggle, alignment=Qt.AlignmentFlag.AlignTop)
+
+        self.label = QLabel()
+        lf = QFont()
+        lf.setPointSize(11)
+        self.label.setFont(lf)
+        self.label.setWordWrap(True)
+        layout.addWidget(self.label, 1)
+
+        # Inline editor — hidden until the row is double-clicked. Lives in the
+        # same layout slot; only one of label/editor is visible at a time.
+        self.editor = QLineEdit(self.todo.text)
+        self.editor.setVisible(False)
+        self.editor.setStyleSheet(
+            f"QLineEdit {{ background-color: {theme.SURFACE_2};"
+            f" border: 1px solid {theme.ACCENT}; border-radius: 6px;"
+            f" padding: 4px 8px; color: {theme.TEXT}; font-size: 11px;"
+            f" selection-background-color: {theme.ACCENT};"
+            f" selection-color: {theme.BG}; }}"
+        )
+        self.editor.returnPressed.connect(self._commit_edit)
+        self.editor.installEventFilter(self)
+        layout.addWidget(self.editor, 1)
+
+        self.remove_btn = QPushButton("×")
+        self.remove_btn.setObjectName("ghost")
+        self.remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.remove_btn.setFixedSize(24, 24)
+        self.remove_btn.setToolTip("Delete task")
+        self.remove_btn.clicked.connect(self.remove_clicked.emit)
+        layout.addWidget(self.remove_btn, alignment=Qt.AlignmentFlag.AlignTop)
+
+        self._restyle()
+
+    def _on_toggle(self, checked: bool) -> None:
+        self.todo.done = checked
+        self._restyle()
+        self.toggled.emit(checked)
+
+    def _restyle(self) -> None:
+        font = self.label.font()
+        font.setStrikeOut(self.todo.done)
+        self.label.setFont(font)
+        text = self.todo.text.strip()
+        if text:
+            self.label.setText(text)
+            color = theme.TEXT_MUTED if self.todo.done else theme.TEXT
+            self.label.setToolTip("")
+        else:
+            self.label.setText("(empty — double-click to edit)")
+            color = theme.TEXT_MUTED
+        self.label.setStyleSheet(f"color: {color}; background: transparent;")
+
+    # ── inline edit ──
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        try:
+            pos = event.position().toPoint()
+        except AttributeError:
+            pos = event.pos()
+        child = self.childAt(pos)
+        if child is self.toggle or child is self.remove_btn:
+            super().mouseDoubleClickEvent(event)
+            return
+        self.begin_edit()
+        event.accept()
+
+    def begin_edit(self) -> None:
+        if self._editing:
+            return
+        self._editing = True
+        self.editor.setText(self.todo.text)
+        self.label.setVisible(False)
+        self.editor.setVisible(True)
+        self.editor.setFocus()
+        self.editor.selectAll()
+
+    def _commit_edit(self) -> None:
+        if not self._editing:
+            return
+        self._editing = False
+        text = self.editor.text().strip()
+        self.editor.setVisible(False)
+        self.label.setVisible(True)
+        if text != self.todo.text:
+            self.todo.text = text
+            self._restyle()
+            self.edited.emit(text)
+        else:
+            self._restyle()
+
+    def _cancel_edit(self) -> None:
+        if not self._editing:
+            return
+        self._editing = False
+        self.editor.setVisible(False)
+        self.label.setVisible(True)
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self.editor:
+            if (event.type() == QEvent.Type.KeyPress
+                    and event.key() == Qt.Key.Key_Escape):
+                self._cancel_edit()
+                return True
+            if event.type() == QEvent.Type.FocusOut and self._editing:
+                self._commit_edit()
+        return super().eventFilter(obj, event)
+
+    # ── in-place updates ──
+
+    def set_done(self, done: bool) -> None:
+        self.todo.done = done
+        self.toggle.blockSignals(True)
+        self.toggle.setChecked(done)
+        self.toggle.blockSignals(False)
+        self._restyle()

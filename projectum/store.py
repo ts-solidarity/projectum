@@ -156,6 +156,14 @@ class Playlist:
         self.videos = merged
 
 
+@dataclass
+class Todo:
+    id: str
+    text: str
+    done: bool = False
+    position: int = 0  # manual sort key (drag-to-reorder)
+
+
 class ProjectStore:
     STORE_FILENAME = ".projectum.json"
 
@@ -165,6 +173,7 @@ class ProjectStore:
         self.orphans: dict[str, dict] = {}
         self.tag_colors: dict[str, str] = {}
         self.playlists: list[Playlist] = []
+        self.todos: list[Todo] = []  # folder-level to-do list (Todo tab)
         self.notes: str = ""  # folder-level scratchpad shown in the Notes tab
         self.load()
 
@@ -323,6 +332,28 @@ class ProjectStore:
                 ))
         self.playlists = new_playlists
 
+        # ── Todos ── preserve existing instances by id (same rationale as
+        # projects/playlists: callers/rows hold references across reloads).
+        existing_todos = {t.id: t for t in self.todos}
+        new_todos: list[Todo] = []
+        raw_todos = data.get("todos") or []
+        if not isinstance(raw_todos, list):
+            raw_todos = []
+        for tdata in raw_todos:
+            if not isinstance(tdata, dict):
+                continue
+            tid = tdata.get("id") or uuid.uuid4().hex
+            et = existing_todos.get(tid)
+            text = _as_str(tdata.get("text"), "")
+            done = bool(tdata.get("done", False))
+            position = _as_int(tdata.get("position", 0))
+            if et is not None:
+                et.text, et.done, et.position = text, done, position
+                new_todos.append(et)
+            else:
+                new_todos.append(Todo(id=tid, text=text, done=done, position=position))
+        self.todos = new_todos
+
     def save(self) -> None:
         payload = {
             "version": 1,
@@ -365,6 +396,15 @@ class ProjectStore:
                     ],
                 }
                 for pl in self.playlists
+            ],
+            "todos": [
+                {
+                    "id": t.id,
+                    "text": t.text,
+                    "done": t.done,
+                    "position": t.position,
+                }
+                for t in self.todos
             ],
         }
         tmp = self.store_path.with_suffix(".json.tmp")
@@ -471,3 +511,42 @@ class ProjectStore:
             if pl.id == playlist_id:
                 return pl
         return None
+
+    # ── Todos ──
+
+    def sorted_todos(self) -> list[Todo]:
+        """Todos in manual order (``position``); ties keep insertion order."""
+        return sorted(self.todos, key=lambda t: t.position)
+
+    def add_todo(self, text: str) -> Todo:
+        pos = max((t.position for t in self.todos), default=-1) + 1
+        todo = Todo(id=uuid.uuid4().hex, text=text, position=pos)
+        self.todos.append(todo)
+        self.save()
+        return todo
+
+    def remove_todo(self, todo_id: str) -> bool:
+        for i, t in enumerate(self.todos):
+            if t.id == todo_id:
+                del self.todos[i]
+                self.save()
+                return True
+        return False
+
+    def get_todo(self, todo_id: str) -> Todo | None:
+        for t in self.todos:
+            if t.id == todo_id:
+                return t
+        return None
+
+    def reorder_todos(self, ids_in_order: list[str]) -> None:
+        """Assign sequential ``position`` values. Caller saves."""
+        by_id = {t.id: t for t in self.todos}
+        for i, tid in enumerate(ids_in_order):
+            t = by_id.get(tid)
+            if t is not None:
+                t.position = i
+
+    def todo_stats(self) -> tuple[int, int]:
+        done = sum(1 for t in self.todos if t.done)
+        return done, len(self.todos)
