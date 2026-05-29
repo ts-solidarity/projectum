@@ -146,7 +146,15 @@ class TagChip(QWidget):
                 # Reserve the right portion of the chip for the × so the
                 # text stays centered in the left part.
                 text_rect.setRight(text_rect.right() - self.REMOVE_BOX)
-            p.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, self.tag)
+            # Elide to the available width. When the chip has room (the
+            # common case) this is a no-op and the full tag shows; when a
+            # QHBoxLayout shrinks the chip below its hint (narrow sidebar,
+            # several tags) the text becomes e.g. "infrastr…" instead of a
+            # mid-glyph clip on both sides.
+            fm = self.fontMetrics()
+            avail = max(0, int(text_rect.width()) - 2)
+            label = fm.elidedText(self.tag, Qt.TextElideMode.ElideRight, avail)
+            p.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, label)
 
             if self._removable:
                 self._paint_remove_glyph(p, base)
@@ -206,6 +214,12 @@ class CompletionToggle(QWidget):
 
     def _start_pulse(self) -> None:
         from PySide6.QtCore import QEasingCurve, QPropertyAnimation
+        # Stop any in-flight pulse first — otherwise the old animation (kept
+        # alive by its QObject parent) keeps driving the `pulse` property and
+        # the two fight, causing jank on rapid toggles.
+        prev = getattr(self, "_anim", None)
+        if isinstance(prev, QPropertyAnimation):
+            prev.stop()
         anim = QPropertyAnimation(self, b"pulse", self)
         anim.setDuration(280)
         anim.setStartValue(0.0)

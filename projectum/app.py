@@ -480,10 +480,8 @@ class MainWindow(QMainWindow):
         ev = QVBoxLayout(empty)
         ev.addStretch()
         msg = QLabel("Select a project")
+        msg.setObjectName("emptyHint")  # recolors with the theme stylesheet
         msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        msg.setStyleSheet(
-            f"color: {theme.TEXT_MUTED}; font-size: 14px; background: transparent;"
-        )
         ev.addWidget(msg)
         ev.addStretch()
         self.detail_stack.addWidget(empty)
@@ -661,10 +659,8 @@ class MainWindow(QMainWindow):
         ev = QVBoxLayout(empty)
         ev.addStretch()
         msg = QLabel("Select a playlist")
+        msg.setObjectName("emptyHint")  # recolors with the theme stylesheet
         msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        msg.setStyleSheet(
-            f"color: {theme.TEXT_MUTED}; font-size: 14px; background: transparent;"
-        )
         ev.addWidget(msg)
         ev.addStretch()
         self.playlist_detail_stack.addWidget(empty)
@@ -1028,6 +1024,11 @@ class MainWindow(QMainWindow):
         # Flush pending writes to the *previous* folder before swapping
         # stores — otherwise typed-but-unsaved notes get lost.
         self._flush_pending_writes()
+        # Drop any in-flight playlist fetches from the previous folder so a
+        # late result can't add/modify a playlist in the new folder. The
+        # runnables keep running but _handle_fetch_done/_failed no-op when
+        # the url is no longer in the dict.
+        self._pending_fetches.clear()
         try:
             self.store = ProjectStore(path)
         except Exception as e:
@@ -2150,10 +2151,15 @@ class MainWindow(QMainWindow):
             )
             return
         # Flush pending notes so the upcoming _load_playlist_detail doesn't
-        # overwrite the editor with stale persisted text.
+        # overwrite the editor with stale persisted text. Both playlist-level
+        # and per-video notes — merge_fetch reuses Video instances by id so a
+        # flushed video note lands on the right (still-present) instance.
         if self._playlist_notes_save_timer.isActive():
             self._playlist_notes_save_timer.stop()
             self._save_playlist_notes()
+        if self._video_notes_save_timer.isActive():
+            self._video_notes_save_timer.stop()
+            self._save_video_notes()
         self.current_playlist.merge_fetch(data)
         self.store.save()
         self._load_playlist_detail(self.current_playlist)

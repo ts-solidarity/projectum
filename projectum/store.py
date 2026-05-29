@@ -201,7 +201,10 @@ class ProjectStore:
             name: d
             for name, d in all_persisted.items()
             if name not in seen
-            and (d.get("notes") or d.get("tags") or d.get("completed"))
+            and (
+                d.get("notes") or d.get("tags")
+                or d.get("completed") or d.get("tested")
+            )
         }
 
         existing_playlists = {pl.id: pl for pl in self.playlists}
