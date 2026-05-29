@@ -294,7 +294,7 @@ def apply_theme(name: str) -> None:
     global TEXT, TEXT_DIM, TEXT_MUTED
     global ACCENT, ACCENT_HOVER, ACCENT_2
     global SUCCESS, WARNING, DANGER, DANGER_HOVER, LIST_HOVER, INFO
-    if name not in THEMES:
+    if not isinstance(name, str) or name not in THEMES:
         name = DEFAULT_THEME
     t = THEMES[name]
     _current_theme_name = name

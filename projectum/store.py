@@ -11,9 +11,35 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+
+
+def _as_int(value, default: int = 0) -> int:
+    """Coerce a persisted value to int, falling back on bad/missing data."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_str(value, default: str = "") -> str:
+    """Return ``value`` if it is a string, else ``default``."""
+    return value if isinstance(value, str) else default
+
+
+def _as_str_list(value) -> list[str]:
+    """Coerce a persisted value to a list of strings.
+
+    A bare string (e.g. a hand-edited ``"tags": "abc"``) must NOT be exploded
+    into individual characters, so anything that isn't already a list is
+    treated as empty.
+    """
+    if not isinstance(value, list):
+        return []
+    return [str(x) for x in value]
 
 
 @dataclass
@@ -88,17 +114,22 @@ class Playlist:
         self.fetched_at = datetime.now().isoformat(timespec="seconds")
 
         new_videos = fetched.get("videos", []) or []
-        existing = {v.id: v for v in self.videos}
-        seen: set[str] = set()
+        # Bucket existing videos by id in FIFO order so a playlist that
+        # legitimately repeats a video id pairs each fetched occurrence with a
+        # distinct existing Video (preserving its completion/notes) instead of
+        # collapsing every occurrence onto one shared object.
+        existing: dict[str, deque[Video]] = {}
+        for v in self.videos:
+            existing.setdefault(v.id, deque()).append(v)
         merged: list[Video] = []
 
         for v in new_videos:
             vid = v.get("id") or ""
             if not vid:
                 continue
-            seen.add(vid)
-            if vid in existing:
-                e = existing[vid]
+            bucket = existing.get(vid)
+            if bucket:
+                e = bucket.popleft()
                 e.title = v.get("title", e.title)
                 e.duration = v.get("duration", e.duration)
                 e.url = v.get("url", e.url)
@@ -114,8 +145,11 @@ class Playlist:
                     )
                 )
 
-        for vid, v in existing.items():
-            if vid not in seen:
+        # Anything left in the buckets is no longer upstream (or a surplus
+        # duplicate the fresh fetch didn't account for) — keep it, flagged
+        # unavailable.
+        for bucket in existing.values():
+            for v in bucket:
                 v.unavailable = True
                 merged.append(v)
 
@@ -145,11 +179,20 @@ class ProjectStore:
                 data = json.loads(self.store_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 data = {}
+        # A structurally-valid-but-wrong-typed file (e.g. a top-level list)
+        # must not abort the whole load.
+        if not isinstance(data, dict):
+            data = {}
 
-        persisted_active = data.get("projects", {}) or {}
-        persisted_orphans = data.get("_orphans", {}) or {}
+        persisted_active = data.get("projects") or {}
+        persisted_orphans = data.get("_orphans") or {}
+        if not isinstance(persisted_active, dict):
+            persisted_active = {}
+        if not isinstance(persisted_orphans, dict):
+            persisted_orphans = {}
         all_persisted = {**persisted_orphans, **persisted_active}
-        self.tag_colors = dict(data.get("tag_colors", {}) or {})
+        tag_colors = data.get("tag_colors") or {}
+        self.tag_colors = dict(tag_colors) if isinstance(tag_colors, dict) else {}
         self.notes = str(data.get("notes", ""))
 
         try:
@@ -174,14 +217,16 @@ class ProjectStore:
             name = entry.name
             seen.add(name)
             d = all_persisted.get(name, {})
+            if not isinstance(d, dict):
+                d = {}
             ex = existing_projects.get(name)
             if ex is not None:
                 ex.path = str(entry)
                 ex.completed = bool(d.get("completed", False))
                 ex.notes = str(d.get("notes", ""))
-                ex.tags = list(d.get("tags", []) or [])
+                ex.tags = _as_str_list(d.get("tags"))
                 ex.pinned = bool(d.get("pinned", False))
-                ex.position = int(d.get("position", 0))
+                ex.position = _as_int(d.get("position", 0))
                 ex.tested = bool(d.get("tested", False))
                 new_projects[name] = ex
             else:
@@ -190,9 +235,9 @@ class ProjectStore:
                     path=str(entry),
                     completed=bool(d.get("completed", False)),
                     notes=str(d.get("notes", "")),
-                    tags=list(d.get("tags", []) or []),
+                    tags=_as_str_list(d.get("tags")),
                     pinned=bool(d.get("pinned", False)),
-                    position=int(d.get("position", 0)),
+                    position=_as_int(d.get("position", 0)),
                     tested=bool(d.get("tested", False)),
                 )
         self.projects = new_projects
@@ -201,29 +246,42 @@ class ProjectStore:
             name: d
             for name, d in all_persisted.items()
             if name not in seen
+            and isinstance(d, dict)
             and (
                 d.get("notes") or d.get("tags")
                 or d.get("completed") or d.get("tested")
+                or d.get("pinned") or d.get("position")
             )
         }
 
         existing_playlists = {pl.id: pl for pl in self.playlists}
         new_playlists: list[Playlist] = []
-        for pdata in data.get("playlists", []) or []:
+        raw_playlists = data.get("playlists") or []
+        if not isinstance(raw_playlists, list):
+            raw_playlists = []
+        for pdata in raw_playlists:
+            if not isinstance(pdata, dict):
+                continue
             pid = pdata.get("id") or uuid.uuid4().hex
             existing_pl = existing_playlists.get(pid)
-            existing_videos = (
-                {v.id: v for v in existing_pl.videos} if existing_pl else {}
-            )
+            # Bucket existing video instances by id (FIFO) so repeated ids
+            # don't collapse onto one shared object on reload.
+            existing_videos: dict[str, deque[Video]] = {}
+            if existing_pl:
+                for ev in existing_pl.videos:
+                    existing_videos.setdefault(ev.id, deque()).append(ev)
             videos: list[Video] = []
             for v in (pdata.get("videos") or []):
+                if not isinstance(v, dict):
+                    continue
                 vid = v.get("id") or ""
                 if not vid:
                     continue
-                ev = existing_videos.get(vid)
+                bucket = existing_videos.get(vid)
+                ev = bucket.popleft() if bucket else None
                 if ev is not None:
-                    ev.title = v.get("title", "(no title)")
-                    ev.url = v.get("url", "")
+                    ev.title = _as_str(v.get("title"), "(no title)")
+                    ev.url = _as_str(v.get("url"), "")
                     ev.duration = v.get("duration")
                     ev.completed = bool(v.get("completed", False))
                     ev.notes = str(v.get("notes", ""))
@@ -232,36 +290,36 @@ class ProjectStore:
                 else:
                     videos.append(Video(
                         id=vid,
-                        title=v.get("title", "(no title)"),
-                        url=v.get("url", ""),
+                        title=_as_str(v.get("title"), "(no title)"),
+                        url=_as_str(v.get("url"), ""),
                         duration=v.get("duration"),
                         completed=bool(v.get("completed", False)),
                         notes=str(v.get("notes", "")),
                         unavailable=bool(v.get("unavailable", False)),
                     ))
             if existing_pl is not None:
-                existing_pl.url = pdata.get("url", "")
-                existing_pl.title = pdata.get("title", "(untitled)")
-                existing_pl.uploader = pdata.get("uploader", "")
-                existing_pl.fetched_at = pdata.get("fetched_at", "")
-                existing_pl.tags = list(pdata.get("tags", []) or [])
+                existing_pl.url = _as_str(pdata.get("url"), "")
+                existing_pl.title = _as_str(pdata.get("title"), "(untitled)")
+                existing_pl.uploader = _as_str(pdata.get("uploader"), "")
+                existing_pl.fetched_at = _as_str(pdata.get("fetched_at"), "")
+                existing_pl.tags = _as_str_list(pdata.get("tags"))
                 existing_pl.notes = str(pdata.get("notes", ""))
                 existing_pl.pinned = bool(pdata.get("pinned", False))
-                existing_pl.position = int(pdata.get("position", 0))
+                existing_pl.position = _as_int(pdata.get("position", 0))
                 existing_pl.videos = videos
                 new_playlists.append(existing_pl)
             else:
                 new_playlists.append(Playlist(
                     id=pid,
-                    url=pdata.get("url", ""),
-                    title=pdata.get("title", "(untitled)"),
-                    uploader=pdata.get("uploader", ""),
-                    fetched_at=pdata.get("fetched_at", ""),
+                    url=_as_str(pdata.get("url"), ""),
+                    title=_as_str(pdata.get("title"), "(untitled)"),
+                    uploader=_as_str(pdata.get("uploader"), ""),
+                    fetched_at=_as_str(pdata.get("fetched_at"), ""),
                     videos=videos,
-                    tags=list(pdata.get("tags", []) or []),
+                    tags=_as_str_list(pdata.get("tags")),
                     notes=str(pdata.get("notes", "")),
                     pinned=bool(pdata.get("pinned", False)),
-                    position=int(pdata.get("position", 0)),
+                    position=_as_int(pdata.get("position", 0)),
                 ))
         self.playlists = new_playlists
 

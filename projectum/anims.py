@@ -70,12 +70,22 @@ def _effect_for(widget: QWidget) -> QGraphicsOpacityEffect:
 
 def _stop_anim(widget: QWidget) -> None:
     anim = getattr(widget, "_anim", None)
-    if isinstance(anim, QPropertyAnimation) and anim.state() != QPropertyAnimation.State.Stopped:
-        try:
-            anim.finished.disconnect()
-        except (TypeError, RuntimeError):
-            pass
-        anim.stop()
+    if not isinstance(anim, QPropertyAnimation):
+        return
+    try:
+        if anim.state() != QPropertyAnimation.State.Stopped:
+            try:
+                anim.finished.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            anim.stop()
+        # The animation is parented to the widget, so simply dropping our
+        # reference wouldn't free it — without this, every fade/slide leaks a
+        # QPropertyAnimation as a permanent child of the widget.
+        anim.deleteLater()
+    except RuntimeError:
+        pass
+    widget._anim = None
 
 
 # ──────────────────────── fades for SIMPLE widgets ────────────────────────
@@ -127,10 +137,31 @@ def fade_out(
 # ──────────────────────── cross-fade for complex stacks ────────────────────────
 
 
+class _OverlayResizer(QObject):
+    """Keeps a cross-fade overlay matched to its stack's size during the fade.
+
+    The overlay is an absolutely-positioned child (not in a layout), so without
+    this it keeps its initial geometry and misaligns if the window resizes
+    mid-fade.
+    """
+
+    def __init__(self, overlay: QWidget, stack: QStackedWidget):
+        super().__init__(stack)
+        self._overlay = overlay
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.Resize:
+            try:
+                self._overlay.setGeometry(0, 0, obj.width(), obj.height())
+            except RuntimeError:
+                pass
+        return False
+
+
 def cross_fade_stack(
     stack: QStackedWidget,
     new_index: int,
-    duration: int = 200,
+    duration: int = 160,
 ) -> None:
     """Crossfade ``stack`` to ``new_index`` via a pixmap-overlay snapshot.
 
@@ -176,6 +207,10 @@ def cross_fade_stack(
     overlay.show()
     stack._cross_fade_overlay = overlay
 
+    # Track stack resizes so the snapshot stays aligned during the fade.
+    resizer = _OverlayResizer(overlay, stack)
+    stack.installEventFilter(resizer)
+
     eff = QGraphicsOpacityEffect(overlay)
     eff.setOpacity(1.0)
     overlay.setGraphicsEffect(eff)
@@ -187,6 +222,11 @@ def cross_fade_stack(
     anim.setEasingCurve(QEasingCurve.Type.OutCubic)
 
     def _cleanup():
+        try:
+            stack.removeEventFilter(resizer)
+        except RuntimeError:
+            pass
+        resizer.deleteLater()
         if getattr(stack, "_cross_fade_overlay", None) is overlay:
             stack._cross_fade_overlay = None
         overlay.deleteLater()
@@ -338,8 +378,16 @@ def animate_progress(
 ) -> QVariantAnimation | None:
     """Smoothly tween a QProgressBar's value to ``target``."""
     existing = getattr(bar, "_progress_anim", None)
-    if isinstance(existing, QVariantAnimation) and existing.state() != QVariantAnimation.State.Stopped:
-        existing.stop()
+    if isinstance(existing, QVariantAnimation):
+        try:
+            if existing.state() != QVariantAnimation.State.Stopped:
+                existing.stop()
+            # Parented to the bar — free it so calls don't accumulate
+            # animations as permanent children.
+            existing.deleteLater()
+        except RuntimeError:
+            pass
+        bar._progress_anim = None
     start = bar.value()
     if start == target:
         return None
@@ -370,7 +418,7 @@ class SmoothScrollFilter(QObject):
     no-op delta on every event.
     """
 
-    DURATION_MS = 220
+    DURATION_MS = 150
     PIXELS_PER_NOTCH = 120
 
     def __init__(self, target: QAbstractScrollArea):
@@ -404,8 +452,19 @@ class SmoothScrollFilter(QObject):
         self._animating = False
         self._end_target = None
 
-    def _on_sb_value_changed(self, _v: int) -> None:
+    def _on_sb_value_changed(self, v: int) -> None:
         if not self._animating:
+            self._end_target = None
+            return
+        # An external value change DURING our animation (keyboard, drag,
+        # setCurrentRow, model reload) must also void the cached target —
+        # otherwise the next wheel notch composes against a stale value and
+        # jumps back. Tell ours apart from external ones by comparing against
+        # the animation's own current value.
+        current = self._anim.currentValue()
+        if current is not None and v != int(current):
+            self._anim.stop()
+            self._animating = False
             self._end_target = None
 
     def _reset(self) -> None:
@@ -419,6 +478,14 @@ class SmoothScrollFilter(QObject):
             return False
         # Don't take over modifier-wheel (Ctrl=zoom in most apps).
         if event.modifiers() != Qt.KeyboardModifier.NoModifier:
+            return False
+        # Let high-precision / trackpad scrolling go to NATIVE handling.
+        # Those events carry a pixelDelta and already produce smooth,
+        # low-latency, momentum-aware pixel scrolling — intercepting them and
+        # re-animating over a tween only adds latency and caps them at the
+        # animation tick rate. We only smooth discrete mouse-wheel notches
+        # (pixelDelta is null for a classic wheel).
+        if not event.pixelDelta().isNull():
             return False
         delta_y = event.angleDelta().y()
         if delta_y == 0:

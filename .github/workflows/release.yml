@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  appimage:
+    name: Build & publish AppImage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install python-appimage build
+
+      - name: Build AppImage
+        run: ./packaging/appimage/build-appimage.sh
+
+      # Qt needs a few X libs present even on a headless display.
+      - name: Install GUI runtime deps for smoke test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libegl1 libxkbcommon0 libxkbcommon-x11-0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 libxcb-sync1 libxcb-xfixes0 \
+            libxcb-cursor0 libdbus-1-3 libgl1
+
+      - name: Smoke-test the AppImage (offscreen)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          app="$(ls build/appimage/*.AppImage)"
+          "$app" --appimage-extract >/dev/null
+          cat > smoke.py <<'PY'
+          import os
+          os.environ["QT_QPA_PLATFORM"] = "offscreen"
+          from PySide6.QtWidgets import QApplication
+          from PySide6.QtCore import QTimer
+          import projectum
+          from projectum.app import MainWindow
+          from projectum import theme
+          app = QApplication([])
+          theme.apply_theme("dark")
+          app.setStyleSheet(theme.build_stylesheet())
+          win = MainWindow()
+          win.show()
+          QTimer.singleShot(250, app.quit)
+          print("AppImage smoke OK — projectum", projectum.__version__, "rc", app.exec())
+          PY
+          ./squashfs-root/AppRun smoke.py
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Projectum-x86_64.AppImage
+          path: build/appimage/*.AppImage
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/appimage/*.AppImage
+          fail_on_unmatched_files: true

@@ -877,6 +877,7 @@ class SettingsDialog(QWidget):
         self.setObjectName("settingsDialog")
         self.setMinimumWidth(420)
         self._suppress = True
+        self._last_emitted: dict | None = None
         self._build(current_theme, current_font_family, current_font_size)
         self._suppress = False
 
@@ -1001,11 +1002,17 @@ class SettingsDialog(QWidget):
         )
         family = self.font_combo.currentText().strip() or "Inter"
         size = int(self.size_spin.value())
-        self.settings_changed.emit({
+        payload = {
             "theme": theme_key,
             "font_family": family,
             "font_size": size,
-        })
+        }
+        # font_combo wires both currentIndexChanged and editingFinished, so a
+        # single pick fires twice — skip if nothing actually changed.
+        if payload == self._last_emitted:
+            return
+        self._last_emitted = payload
+        self.settings_changed.emit(payload)
 
     def _on_close(self) -> None:
         fade_window_close(self, duration=120, on_done=self._finish_close)
@@ -1522,11 +1529,17 @@ class MarkdownHighlighter(QSyntaxHighlighter):
         m = self.HEADING_RE.match(text)
         if m:
             level = len(m.group(2))
-            self.setFormat(0, len(text), self._headings[level - 1])
+            heading_fmt = self._headings[level - 1]
+            self.setFormat(0, len(text), heading_fmt)
             # Dim the leading `#`s + the space after them.
             self.setFormat(m.start(2), len(m.group(2)) + 1, self._marker)
-            # Inline patterns can still apply inside the heading body.
-            self._apply_inline(text, skip_marker_dimming=True)
+            # Inline patterns can still apply inside the heading body — pass the
+            # heading's point size so bold/code/etc don't reset the glyph size
+            # (setFormat REPLACES the char format, it doesn't merge).
+            self._apply_inline(
+                text, skip_marker_dimming=True,
+                heading_size=heading_fmt.fontPointSize(),
+            )
             return
 
         # ───── Blockquote ─────
@@ -1545,44 +1558,54 @@ class MarkdownHighlighter(QSyntaxHighlighter):
 
         self._apply_inline(text)
 
-    def _apply_inline(self, text: str, *, skip_marker_dimming: bool = False) -> None:
-        # Inline code first so its background/foreground claim its range
-        # before bold/italic could overwrite parts of the same span.
+    def _apply_inline(
+        self,
+        text: str,
+        *,
+        skip_marker_dimming: bool = False,
+        heading_size: float | None = None,
+    ) -> None:
+        def sized(fmt: QTextCharFormat) -> QTextCharFormat:
+            # Inside a heading, carry the heading point size onto each inline
+            # format so it doesn't shrink back to the base size.
+            if not heading_size or heading_size <= 0:
+                return fmt
+            f = QTextCharFormat(fmt)
+            f.setFontPointSize(heading_size)
+            return f
+
+        # Inline code first so its background/foreground claim its range; record
+        # the spans so later inline formats don't overwrite the code styling
+        # when their markers happen to fall inside the backticks.
+        code_spans: list[tuple[int, int]] = []
         for m in self.INLINE_CODE_RE.finditer(text):
-            self.setFormat(m.start(), m.end() - m.start(), self._inline_code)
+            self.setFormat(m.start(), m.end() - m.start(), sized(self._inline_code))
+            code_spans.append((m.start(), m.end()))
 
-        for m in self.BOLD_RE.finditer(text):
-            self.setFormat(m.start(), m.end() - m.start(), self._bold)
-            if not skip_marker_dimming:
-                self.setFormat(m.start(), 2, self._marker)
-                self.setFormat(m.end() - 2, 2, self._marker)
-        for m in self.UNDERSCORE_BOLD_RE.finditer(text):
-            self.setFormat(m.start(), m.end() - m.start(), self._bold)
-            if not skip_marker_dimming:
-                self.setFormat(m.start(), 2, self._marker)
-                self.setFormat(m.end() - 2, 2, self._marker)
+        def in_code(start: int, end: int) -> bool:
+            return any(s <= start and end <= e for s, e in code_spans)
 
-        for m in self.ITALIC_RE.finditer(text):
-            self.setFormat(m.start(), m.end() - m.start(), self._italic)
-            if not skip_marker_dimming:
-                self.setFormat(m.start(), 1, self._marker)
-                self.setFormat(m.end() - 1, 1, self._marker)
-        for m in self.UNDERSCORE_ITALIC_RE.finditer(text):
-            self.setFormat(m.start(), m.end() - m.start(), self._italic)
-            if not skip_marker_dimming:
-                self.setFormat(m.start(), 1, self._marker)
-                self.setFormat(m.end() - 1, 1, self._marker)
+        def apply(regex, fmt, marker_len: int) -> None:
+            for m in regex.finditer(text):
+                if in_code(m.start(), m.end()):
+                    continue
+                self.setFormat(m.start(), m.end() - m.start(), sized(fmt))
+                if not skip_marker_dimming:
+                    self.setFormat(m.start(), marker_len, self._marker)
+                    self.setFormat(m.end() - marker_len, marker_len, self._marker)
 
-        for m in self.STRIKE_RE.finditer(text):
-            self.setFormat(m.start(), m.end() - m.start(), self._strike)
-            if not skip_marker_dimming:
-                self.setFormat(m.start(), 2, self._marker)
-                self.setFormat(m.end() - 2, 2, self._marker)
+        apply(self.BOLD_RE, self._bold, 2)
+        apply(self.UNDERSCORE_BOLD_RE, self._bold, 2)
+        apply(self.ITALIC_RE, self._italic, 1)
+        apply(self.UNDERSCORE_ITALIC_RE, self._italic, 1)
+        apply(self.STRIKE_RE, self._strike, 2)
 
         for m in self.LINK_RE.finditer(text):
+            if in_code(m.start(), m.end()):
+                continue
             # `[label]`
             label_end = m.start() + 1 + len(m.group(1))  # past the closing ]
-            self.setFormat(m.start() + 1, len(m.group(1)), self._link)
+            self.setFormat(m.start() + 1, len(m.group(1)), sized(self._link))
             if not skip_marker_dimming:
                 # Dim everything except the visible label text.
                 self.setFormat(m.start(), 1, self._marker)            # [
@@ -1593,9 +1616,13 @@ class MarkdownHighlighter(QSyntaxHighlighter):
 
 
 def _format_duration(seconds: int | None) -> str:
-    if not seconds or seconds <= 0:
+    # Coerce first — a persisted/non-int value must not raise on comparison.
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
         return ""
-    seconds = int(seconds)
+    if seconds <= 0:
+        return ""
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
     if h:

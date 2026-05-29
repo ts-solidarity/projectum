@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -137,6 +138,15 @@ class MainWindow(QMainWindow):
         self._playlist_url_input: QLineEdit | None = None
         self._playlist_tag_editor: TagEditor | None = None
         self._pending_fetches: dict[str, tuple[object, object]] = {}
+        # Playlist ids with an in-flight Refresh fetch. The Refresh button is
+        # a single shared widget in the detail panel, so its enabled/label
+        # state is derived from this set + the current selection rather than
+        # toggled imperatively (which left it stuck when the selection changed
+        # mid-fetch).
+        self._refreshing_playlist_ids: set[str] = set()
+        # Name of a selection hidden by the active search/filter, so it can be
+        # reselected when it becomes visible again.
+        self._hidden_selection: str | None = None
         self._video_notes_save_timer = QTimer(self)
         self._video_notes_save_timer.setSingleShot(True)
         self._video_notes_save_timer.setInterval(450)
@@ -158,6 +168,14 @@ class MainWindow(QMainWindow):
         self._notes_save_timer.setSingleShot(True)
         self._notes_save_timer.setInterval(450)
         self._notes_save_timer.timeout.connect(self._save_notes)
+
+        # Debounce search filtering so each keystroke doesn't re-scan every
+        # row (and reselect/reload the detail panel) synchronously — that
+        # adds up on large folders and makes typing feel laggy.
+        self._search_debounce = QTimer(self)
+        self._search_debounce.setSingleShot(True)
+        self._search_debounce.setInterval(90)
+        self._search_debounce.timeout.connect(self._apply_filter)
 
         self._watcher_debounce = QTimer(self)
         self._watcher_debounce.setSingleShot(True)
@@ -390,7 +408,7 @@ class MainWindow(QMainWindow):
             "notes": self.notes_view,
         }.get(key, self.projects_view)
         cross_fade_stack(
-            self.content_stack, self.content_stack.indexOf(target), duration=220,
+            self.content_stack, self.content_stack.indexOf(target), duration=160,
         )
 
     def _build_projects_view(self) -> QWidget:
@@ -1029,6 +1047,11 @@ class MainWindow(QMainWindow):
         # runnables keep running but _handle_fetch_done/_failed no-op when
         # the url is no longer in the dict.
         self._pending_fetches.clear()
+        # Those dropped callbacks never restore the Refresh button / add-input,
+        # so reset that UI here (otherwise it stays stuck "Refreshing…" /
+        # "Fetching…" against the new folder).
+        self._refreshing_playlist_ids.clear()
+        self._reset_playlist_add_ui()
         try:
             self.store = ProjectStore(path)
         except Exception as e:
@@ -1039,13 +1062,18 @@ class MainWindow(QMainWindow):
             self._watcher.removePaths(self._watcher.directories())
         self._watcher.addPath(str(path))
 
-        save_state({"last_folder": str(path)})
+        # Merge into existing state — save_state writes the whole file, so a
+        # bare write here would clobber persisted settings (theme/font) and
+        # window geometry.
+        st = load_state()
+        st["last_folder"] = str(path)
+        save_state(st)
 
         if self.stack.currentWidget() is not self.main_view:
             cross_fade_stack(
                 self.stack,
                 self.stack.indexOf(self.main_view),
-                duration=260,
+                duration=200,
             )
         self.folder_label.setText(str(path))
         self.folder_label.setToolTip(str(path))
@@ -1053,6 +1081,16 @@ class MainWindow(QMainWindow):
         self.current_playlist = None
         self.current_video = None
         self.tag_filter = None
+        # Reset search + filter so they don't leak across folders.
+        self.current_filter = "all"
+        self.search_query = ""
+        self._hidden_selection = None
+        self.search_input.blockSignals(True)
+        self.search_input.clear()
+        self.search_input.blockSignals(False)
+        for b in self.filter_group.buttons():
+            if b.property("filter_key") == "all":
+                b.setChecked(True)
         self._update_tag_filter_label()
         self._full_rebuild_list()
         self._update_stats()
@@ -1131,12 +1169,16 @@ class MainWindow(QMainWindow):
         self.list_widget.blockSignals(False)
         self._apply_filter(preserve_name=preserve_name)
 
-    def _append_row(self, project: Project) -> QListWidgetItem:
+    def _make_project_row(self, project: Project) -> ProjectRow:
         row = ProjectRow(project, self.store)
         row.completion_changed.connect(
             lambda checked, p=project: self._on_row_completion(p, checked)
         )
         row.tag_right_clicked.connect(self._show_color_picker)
+        return row
+
+    def _append_row(self, project: Project) -> QListWidgetItem:
+        row = self._make_project_row(project)
         item = QListWidgetItem()
         item.setData(Qt.ItemDataRole.UserRole, project.name)
         item.setSizeHint(QSize(0, row.sizeHint().height()))
@@ -1151,7 +1193,7 @@ class MainWindow(QMainWindow):
             return
         target = preserve_name or (
             self.current_project.name if self.current_project else None
-        )
+        ) or self._hidden_selection
         q = self.search_query.lower().strip()
         visible = 0
         target_item: QListWidgetItem | None = None
@@ -1183,10 +1225,23 @@ class MainWindow(QMainWindow):
                     target_item = item
 
         if target_item is not None:
+            # The selection is visible again — restore it (setCurrentItem fires
+            # _on_select, which reloads the detail panel) and forget the
+            # remembered name.
+            self._hidden_selection = None
             self.list_widget.setCurrentItem(target_item)
         elif preserve_name is None:
-            # Filter change hid the current selection (or nothing visible).
-            # Clear so the detail panel matches the list.
+            # Filter/search hid the current selection (or nothing visible).
+            # Flush any pending notes for it FIRST — clearing current_project
+            # with signals blocked bypasses _on_select's flush, so the
+            # debounced save would otherwise no-op and silently lose the edit.
+            if self._notes_save_timer.isActive():
+                self._notes_save_timer.stop()
+                self._save_notes()
+            # Remember the hidden selection so it can be reselected when it
+            # becomes visible again (e.g. the search is cleared).
+            if self.current_project is not None:
+                self._hidden_selection = self.current_project.name
             self.list_widget.blockSignals(True)
             self.list_widget.setCurrentItem(None)
             self.list_widget.blockSignals(False)
@@ -1228,7 +1283,7 @@ class MainWindow(QMainWindow):
 
     def _on_search(self, text: str) -> None:
         self.search_query = text
-        self._apply_filter()
+        self._search_debounce.start()
 
     def _on_filter_clicked(self) -> None:
         btn = self.sender()
@@ -1269,12 +1324,31 @@ class MainWindow(QMainWindow):
     def _persist_project_order(self, *_args) -> None:
         if not self.store:
             return
-        names = []
+        # Qt's InternalMove drag-drop recreates the moved QListWidgetItem
+        # WITHOUT its row widget and invalidates the pointers cached in
+        # _row_items. Re-sync the cache and re-attach a row widget ONLY to the
+        # item(s) that lost one — a full rebuild here would freeze for a few
+        # hundred ms on large folders. Deferred so the drop fully unwinds.
+        QTimer.singleShot(0, self._reconcile_project_rows_after_move)
+
+    def _reconcile_project_rows_after_move(self) -> None:
+        if not self.store:
+            return
+        self._row_items.clear()
+        names: list[str] = []
         for row in range(self.list_widget.count()):
             it = self.list_widget.item(row)
             if it is None:
                 continue
-            names.append(it.data(Qt.ItemDataRole.UserRole))
+            name = it.data(Qt.ItemDataRole.UserRole)
+            names.append(name)
+            self._row_items[name] = it
+            if self.list_widget.itemWidget(it) is None:
+                project = self.store.projects.get(name)
+                if project is not None:
+                    row = self._make_project_row(project)
+                    it.setSizeHint(QSize(0, row.sizeHint().height()))
+                    self.list_widget.setItemWidget(it, row)
         self.store.reorder_projects(names)
         self.store.save()
 
@@ -1315,12 +1389,28 @@ class MainWindow(QMainWindow):
     def _persist_playlist_order(self, *_args) -> None:
         if not self.store:
             return
-        ids = []
+        # See _persist_project_order: re-attach only the moved row's widget
+        # and re-sync the cache instead of a costly full rebuild.
+        QTimer.singleShot(0, self._reconcile_playlist_rows_after_move)
+
+    def _reconcile_playlist_rows_after_move(self) -> None:
+        if not self.store:
+            return
+        self._playlist_items.clear()
+        ids: list[str] = []
         for row in range(self.playlists_list_widget.count()):
             it = self.playlists_list_widget.item(row)
             if it is None:
                 continue
-            ids.append(it.data(Qt.ItemDataRole.UserRole))
+            pid = it.data(Qt.ItemDataRole.UserRole)
+            ids.append(pid)
+            self._playlist_items[pid] = it
+            if self.playlists_list_widget.itemWidget(it) is None:
+                pl = self.store.get_playlist(pid)
+                if pl is not None:
+                    row_w = self._make_playlist_row(pl)
+                    it.setSizeHint(QSize(0, row_w.sizeHint().height()))
+                    self.playlists_list_widget.setItemWidget(it, row_w)
         self.store.reorder_playlists(ids)
         self.store.save()
 
@@ -1332,7 +1422,10 @@ class MainWindow(QMainWindow):
         all_a.triggered.connect(partial(self._set_tag_filter, None))
         menu.addAction(all_a)
         menu.addSeparator()
-        tags = self.store.all_tags()
+        # The tag filter only affects the projects list, so only offer tags
+        # that some project actually uses — a playlist-only tag would hide
+        # every project when selected.
+        tags = sorted({t for p in self.store.projects.values() for t in p.tags})
         if not tags:
             empty_a = QAction("No tags yet", menu)
             empty_a.setEnabled(False)
@@ -1376,7 +1469,7 @@ class MainWindow(QMainWindow):
             # painters (CompletionToggle, TagChip) so a direct opacity-effect
             # fade glitches; this fades only a QLabel overlay of the old
             # empty placeholder.
-            cross_fade_stack(self.detail_stack, 1, duration=220)
+            cross_fade_stack(self.detail_stack, 1, duration=160)
         else:
             self.detail_stack.setCurrentIndex(1)
 
@@ -1618,6 +1711,22 @@ class MainWindow(QMainWindow):
         if isinstance(row, ProjectRow):
             row.set_has_notes(has_notes)
 
+    @staticmethod
+    def _resize_row_deferred(item, row) -> None:
+        """Commit a list row's height AFTER its layout settles.
+
+        refresh_tags()/refresh() deleteLater() the old tag chips; the row's
+        true height only resolves once that deletion is processed on the next
+        event-loop tick. Reading sizeHint() synchronously here returns the
+        no-tags height, which squeezes a row that still has a remaining tag.
+        """
+        def _apply():
+            try:
+                item.setSizeHint(QSize(0, row.sizeHint().height()))
+            except RuntimeError:
+                pass  # row/item gone (folder reloaded) before the tick fired
+        QTimer.singleShot(0, _apply)
+
     def _update_row_tags(self, name: str) -> None:
         item = self._row_items.get(name)
         if item is None:
@@ -1625,7 +1734,7 @@ class MainWindow(QMainWindow):
         row = self.list_widget.itemWidget(item)
         if isinstance(row, ProjectRow):
             row.refresh_tags()
-            item.setSizeHint(QSize(0, row.sizeHint().height()))
+            self._resize_row_deferred(item, row)
 
     # ─── Helpers ─────────────────────────────────────────────────
 
@@ -1673,10 +1782,13 @@ class MainWindow(QMainWindow):
             return
         current = self.store.tag_colors.get(tag)
         popup = ColorPickerPopup(tag, current, parent=self)
+        # Destroy on close (outside-click or button-triggered fade) so popups
+        # don't accumulate as live children of the window on every right-click.
+        popup.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         popup.color_chosen.connect(partial(self._set_tag_color, tag))
         popup.reset.connect(partial(self._set_tag_color, tag, None))
         popup.custom_requested.connect(partial(self._open_custom_color, tag))
-        # Keep a reference so the popup isn't garbage collected.
+        # Keep a reference so the popup isn't garbage collected before shown.
         self._color_popup = popup
         popup.adjustSize()
         cursor_pos = QCursor.pos()
@@ -1714,11 +1826,41 @@ class MainWindow(QMainWindow):
         # Sidebar — playlists
         for pid in list(self._playlist_items.keys()):
             self._update_playlist_row_tags(pid)
-        # Detail panels
+        # Detail panels. Recoloring happens via a full tag rebuild, which
+        # would normally tear down an open inline editor (the color picker is
+        # explicitly usable WHILE editing) — so preserve edit mode and the
+        # in-progress text/caret when an editor is open.
         if self.current_project:
-            self._rebuild_tags()
+            self._rebuild_tags_preserving_editor("_tag_editor", self._rebuild_tags)
         if self.current_playlist:
-            self._rebuild_playlist_tags()
+            self._rebuild_tags_preserving_editor(
+                "_playlist_tag_editor", self._rebuild_playlist_tags
+            )
+
+    def _rebuild_tags_preserving_editor(self, editor_attr: str, rebuild) -> None:
+        """Re-run a tag rebuild, restoring an open inline editor's text/caret.
+
+        ``rebuild(editing=True)`` creates a fresh editor and stores it back on
+        ``self.<editor_attr>``, so we capture the old text/caret, rebuild, then
+        push them onto the new editor.
+        """
+        editor = getattr(self, editor_attr, None)
+        if editor is None:
+            rebuild()
+            return
+        try:
+            text, cursor = editor.text(), editor.cursorPosition()
+        except RuntimeError:
+            rebuild()
+            return
+        rebuild(editing=True)
+        new_editor = getattr(self, editor_attr, None)
+        if new_editor is not None:
+            try:
+                new_editor.setText(text)
+                new_editor.setCursorPosition(min(cursor, len(text)))
+            except RuntimeError:
+                pass
 
     # ─── Playlists ──────────────────────────────────────────────
 
@@ -1732,9 +1874,13 @@ class MainWindow(QMainWindow):
         self.playlists_list_widget.blockSignals(False)
         self._update_playlists_empty_hint()
 
-    def _append_playlist_row(self, pl: Playlist) -> QListWidgetItem:
+    def _make_playlist_row(self, pl: Playlist) -> PlaylistRow:
         row = PlaylistRow(pl, self.store)
         row.tag_right_clicked.connect(self._show_color_picker)
+        return row
+
+    def _append_playlist_row(self, pl: Playlist) -> QListWidgetItem:
+        row = self._make_playlist_row(pl)
         item = QListWidgetItem()
         item.setData(Qt.ItemDataRole.UserRole, pl.id)
         item.setSizeHint(QSize(0, row.sizeHint().height()))
@@ -1778,6 +1924,22 @@ class MainWindow(QMainWindow):
             self.playlist_add_btn.setVisible(True)
             fade_in(self.playlist_add_btn, duration=160)
 
+    def _reset_playlist_add_ui(self) -> None:
+        """Synchronously tear down the add-URL input and restore the button.
+
+        Used on folder change: the in-flight add fetch's callback is dropped
+        (``_pending_fetches.clear()``), so nothing else would un-stick the
+        'Fetching…' button or remove the stale URL field.
+        """
+        if self._playlist_url_input is not None:
+            edit = self._playlist_url_input
+            self._playlist_url_input = None
+            edit.deleteLater()
+        self.playlist_add_btn.setEnabled(True)
+        self.playlist_add_btn.setVisible(True)
+        self.playlist_add_btn.setText("+ Add YouTube playlist")
+        self._set_playlist_error("")
+
     def _set_playlist_error(self, msg: str) -> None:
         self.playlist_error_label.setText(msg)
         self.playlist_error_label.setVisible(bool(msg))
@@ -1792,6 +1954,9 @@ class MainWindow(QMainWindow):
             if existing.url == url:
                 self._set_playlist_error("That playlist is already in the list.")
                 return
+        if url in self._pending_fetches:
+            self._set_playlist_error("That playlist is already being added.")
+            return
         self._playlist_url_input.setEnabled(False)
         self.playlist_add_btn.setVisible(True)
         self.playlist_add_btn.setText("Fetching…")
@@ -1835,9 +2000,13 @@ class MainWindow(QMainWindow):
             return
         pl = self.store.add_playlist(url, data)
         self._hide_playlist_url_input()
-        item = self._append_playlist_row(pl)
+        # Rebuild so the new row lands in its sorted position (a bare append
+        # would drop it at the bottom regardless of sort order), then select.
+        self._rebuild_playlists_list()
         self._update_playlists_empty_hint()
-        self.playlists_list_widget.setCurrentItem(item)
+        item = self._playlist_items.get(pl.id)
+        if item is not None:
+            self.playlists_list_widget.setCurrentItem(item)
 
     def _on_playlist_select(self, current, _previous) -> None:
         # Flush any pending per-video and per-playlist notes for the
@@ -1864,7 +2033,7 @@ class MainWindow(QMainWindow):
         was_empty = self.playlist_detail_stack.currentIndex() == 0
         self._load_playlist_detail(pl)
         if was_empty:
-            cross_fade_stack(self.playlist_detail_stack, 1, duration=220)
+            cross_fade_stack(self.playlist_detail_stack, 1, duration=160)
         else:
             self.playlist_detail_stack.setCurrentIndex(1)
 
@@ -1888,6 +2057,9 @@ class MainWindow(QMainWindow):
         self._rebuild_playlist_tags()
         self._rebuild_video_list(pl)
         self._set_video_notes_state(None)
+        # Derive the Refresh button state from whether THIS playlist has a
+        # fetch in flight, so the shared button reflects the shown playlist.
+        self._sync_refresh_button()
         # Load playlist-level notes — guard textChanged so loading doesn't
         # trip the debounced save back into the same playlist.
         self._loading_playlist_details = True
@@ -1895,6 +2067,13 @@ class MainWindow(QMainWindow):
             self.playlist_notes_edit.setPlainText(pl.notes)
         finally:
             self._loading_playlist_details = False
+
+    def _sync_refresh_button(self) -> None:
+        """Refresh button reflects whether the current playlist is refreshing."""
+        pl = self.current_playlist
+        refreshing = pl is not None and pl.id in self._refreshing_playlist_ids
+        self.pl_refresh_btn.setEnabled(not refreshing)
+        self.pl_refresh_btn.setText("Refreshing…" if refreshing else "Refresh")
 
     def _rebuild_video_list(self, pl: Playlist) -> None:
         self.video_list_widget.blockSignals(True)
@@ -2026,7 +2205,7 @@ class MainWindow(QMainWindow):
         row = self.playlists_list_widget.itemWidget(item)
         if isinstance(row, PlaylistRow):
             row.refresh()
-            item.setSizeHint(QSize(0, row.sizeHint().height()))
+            self._resize_row_deferred(item, row)
 
     def _rebuild_playlist_tags(self, *, editing: bool = False) -> None:
         self._playlist_tag_editor = None
@@ -2121,7 +2300,13 @@ class MainWindow(QMainWindow):
             self.store.save()
             self._rebuild_playlist_tags()
             self._update_playlist_row_tags(self.current_playlist.id)
-            if self.tag_filter == tag and tag not in self.store.all_tags():
+            # The tag filter only affects the projects list, so clear it only
+            # when no PROJECT still uses the tag (mirrors _remove_tag) — a
+            # remaining playlist use is irrelevant to the project filter.
+            project_tags = {
+                t for p in self.store.projects.values() for t in p.tags
+            }
+            if self.tag_filter == tag and tag not in project_tags:
                 self._set_tag_filter(None)
 
     def _update_playlist_row_tags(self, pid: str) -> None:
@@ -2131,39 +2316,63 @@ class MainWindow(QMainWindow):
         row = self.playlists_list_widget.itemWidget(item)
         if isinstance(row, PlaylistRow):
             row.refresh_tags()
-            item.setSizeHint(QSize(0, row.sizeHint().height()))
+            self._resize_row_deferred(item, row)
 
     def _refresh_current_playlist(self) -> None:
         if not self.current_playlist:
             return
-        self.pl_refresh_btn.setEnabled(False)
-        self.pl_refresh_btn.setText("Refreshing…")
-        self._kick_fetch(self.current_playlist.url, on_done=self._on_refresh_done)
+        pid = self.current_playlist.id
+        self._refreshing_playlist_ids.add(pid)
+        self._sync_refresh_button()
+        # Bind the refreshed id so the in-flight marker is cleared by the SAME
+        # id it was added with (resolving by URL alone would leak the marker if
+        # two playlists ever shared a URL).
+        self._kick_fetch(
+            self.current_playlist.url,
+            on_done=partial(self._on_refresh_done, refreshed_id=pid),
+        )
 
-    def _on_refresh_done(self, _url: str, data: dict | None, err: str | None) -> None:
-        self.pl_refresh_btn.setEnabled(True)
-        self.pl_refresh_btn.setText("Refresh")
-        if not self.current_playlist or not self.store:
+    def _on_refresh_done(
+        self, url: str, data: dict | None, err: str | None,
+        *, refreshed_id: str | None = None,
+    ) -> None:
+        if not self.store:
             return
+        if refreshed_id is not None:
+            self._refreshing_playlist_ids.discard(refreshed_id)
+        # Reflect the current selection's refresh state on the shared button.
+        self._sync_refresh_button()
+        # Resolve the playlist that was ACTUALLY refreshed by its URL. The user
+        # may have selected a different playlist while the fetch was in flight;
+        # merging into self.current_playlist would corrupt the wrong one.
+        target = next((pl for pl in self.store.playlists if pl.url == url), None)
+        is_current = target is not None and self.current_playlist is target
         if err or not data:
-            QMessageBox.warning(
-                self, "Projectum", err or "Failed to refresh playlist."
-            )
+            # Only surface the error if the refreshed playlist is still shown.
+            if is_current:
+                QMessageBox.warning(
+                    self, "Projectum", err or "Failed to refresh playlist."
+                )
             return
-        # Flush pending notes so the upcoming _load_playlist_detail doesn't
-        # overwrite the editor with stale persisted text. Both playlist-level
-        # and per-video notes — merge_fetch reuses Video instances by id so a
-        # flushed video note lands on the right (still-present) instance.
-        if self._playlist_notes_save_timer.isActive():
-            self._playlist_notes_save_timer.stop()
-            self._save_playlist_notes()
-        if self._video_notes_save_timer.isActive():
-            self._video_notes_save_timer.stop()
-            self._save_video_notes()
-        self.current_playlist.merge_fetch(data)
+        if target is None:
+            # Playlist was removed while the fetch was in flight — discard.
+            return
+        # Flush pending notes BEFORE merge_fetch so a subsequent
+        # _load_playlist_detail doesn't overwrite the editor with stale text,
+        # and so the flush lands on the right instance. Only meaningful when
+        # the refreshed playlist is the one currently being edited.
+        if is_current:
+            if self._playlist_notes_save_timer.isActive():
+                self._playlist_notes_save_timer.stop()
+                self._save_playlist_notes()
+            if self._video_notes_save_timer.isActive():
+                self._video_notes_save_timer.stop()
+                self._save_video_notes()
+        target.merge_fetch(data)
         self.store.save()
-        self._load_playlist_detail(self.current_playlist)
-        self._refresh_playlist_row_meta(self.current_playlist.id)
+        if is_current:
+            self._load_playlist_detail(target)
+        self._refresh_playlist_row_meta(target.id)
 
     def _remove_current_playlist(self) -> None:
         if not self.current_playlist or not self.store:
@@ -2184,6 +2393,7 @@ class MainWindow(QMainWindow):
         if self._video_notes_save_timer.isActive():
             self._video_notes_save_timer.stop()
         pid = pl.id
+        self._refreshing_playlist_ids.discard(pid)
         self.store.remove_playlist(pid)
         self.store.prune_unused_tag_colors()
         self.store.save()
@@ -2214,20 +2424,29 @@ class MainWindow(QMainWindow):
         self.current_video = None
         self._video_items.clear()
         self.video_list_widget.clear()
-        cross_fade_stack(self.playlist_detail_stack, 0, duration=220)
+        cross_fade_stack(self.playlist_detail_stack, 0, duration=160)
         self._update_playlists_empty_hint()
 
     def _open_current_playlist_url(self) -> None:
         if not self.current_playlist:
             return
-        QDesktopServices.openUrl(QUrl(self.current_playlist.url))
+        url = (self.current_playlist.url or "").strip()
+        if not url:
+            QMessageBox.information(
+                self, "Projectum", "This playlist has no saved URL to open."
+            )
+            return
+        if not QDesktopServices.openUrl(QUrl(url)):
+            QMessageBox.warning(
+                self, "Projectum", f"Couldn't open the playlist URL:\n{url}"
+            )
 
     @staticmethod
     def _format_fetched(iso: str) -> str:
         try:
             dt = datetime.fromisoformat(iso)
-        except ValueError:
-            return iso
+        except (ValueError, TypeError):
+            return str(iso)
         return MainWindow._format_date(dt)
 
     # ─── Settings ────────────────────────────────────────────────
@@ -2242,9 +2461,17 @@ class MainWindow(QMainWindow):
             self._command_palette.input.selectAll()
             return
         palette = CommandPalette(parent=self)
+        # Destroy on close so an activated/closed palette doesn't linger as a
+        # live child of the window (one leak per open otherwise).
+        palette.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         palette.query_changed.connect(self._palette_search)
         palette.activated.connect(self._palette_activate)
         palette.closed.connect(self._on_palette_closed)
+        # destroyed fires on EVERY close (incl. Alt+F4 / WM close, which don't
+        # emit `closed`); identity-guarded so it can't null a newer palette.
+        palette.destroyed.connect(
+            lambda *_a, p=palette: self._forget_if_current("_command_palette", p)
+        )
         self._command_palette = palette
         # Center over the main window, near the top.
         palette.adjustSize()
@@ -2262,7 +2489,15 @@ class MainWindow(QMainWindow):
         palette.input.setFocus()
         fade_window(palette, 1.0, duration=140)
 
-    def _on_palette_closed(self) -> None:
+    def _forget_if_current(self, attr: str, obj) -> None:
+        """Null ``self.<attr>`` when ``obj`` is destroyed, but only if it's
+        still the tracked one — a stale ``destroyed`` from a previous instance
+        must not clobber a newer one.
+        """
+        if getattr(self, attr, None) is obj:
+            setattr(self, attr, None)
+
+    def _on_palette_closed(self, *_args) -> None:
         self._command_palette = None
 
     def _palette_search(self, query: str) -> None:
@@ -2349,10 +2584,15 @@ class MainWindow(QMainWindow):
                     })
 
         # Global notes — single hit summarizing first match line.
-        if q and self.store.notes and q in self.store.notes.casefold():
-            # First line containing the match for the sublabel.
-            lo = self.store.notes.casefold()
-            idx = lo.find(q)
+        notes_match = (
+            re.search(re.escape(query.strip()), self.store.notes, re.IGNORECASE)
+            if q and self.store.notes else None
+        )
+        if notes_match is not None:
+            # Locate the match in the ORIGINAL text (case-insensitive search on
+            # the original, not index-mapping from a casefolded copy, since
+            # casefold can change length and skew the offsets).
+            idx = notes_match.start()
             line_start = self.store.notes.rfind("\n", 0, idx) + 1
             line_end = self.store.notes.find("\n", idx)
             if line_end == -1:
@@ -2379,6 +2619,7 @@ class MainWindow(QMainWindow):
         # Close the palette before navigating so the next view paints uncovered.
         if self._command_palette is not None:
             self._command_palette.close()
+            self._command_palette = None
         if kind == "project":
             self._goto_tab("projects")
             it = self._row_items.get(key)
@@ -2425,8 +2666,16 @@ class MainWindow(QMainWindow):
             theme.current_font_size(),
             parent=self,
         )
+        # Destroy on close so dialogs don't pile up as live children.
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         dialog.settings_changed.connect(self._apply_settings)
         dialog.closed.connect(self._on_settings_closed)
+        # destroyed fires on EVERY close (incl. Alt+F4 / WM close); without it
+        # the WA_DeleteOnClose deletion leaves _settings_dialog dangling and the
+        # next open crashes on .isVisible(). Identity-guarded against clobber.
+        dialog.destroyed.connect(
+            lambda *_a, d=dialog: self._forget_if_current("_settings_dialog", d)
+        )
         self._settings_dialog = dialog
         # Center over the main window and fade in.
         dialog.adjustSize()
@@ -2439,16 +2688,17 @@ class MainWindow(QMainWindow):
         dialog.show()
         fade_window(dialog, 1.0, duration=160)
 
-    def _on_settings_closed(self) -> None:
+    def _on_settings_closed(self, *_args) -> None:
         self._settings_dialog = None
 
     def _apply_settings(self, settings: dict) -> None:
         new_theme = settings.get("theme", theme.DEFAULT_THEME)
         new_family = settings.get("font_family", theme.DEFAULT_FONT_FAMILY)
-        new_size = max(
-            theme.FONT_SIZE_MIN,
-            min(theme.FONT_SIZE_MAX, int(settings.get("font_size", theme.DEFAULT_FONT_SIZE))),
-        )
+        try:
+            raw_size = int(settings.get("font_size", theme.DEFAULT_FONT_SIZE))
+        except (TypeError, ValueError):
+            raw_size = theme.DEFAULT_FONT_SIZE
+        new_size = max(theme.FONT_SIZE_MIN, min(theme.FONT_SIZE_MAX, raw_size))
 
         theme.apply_theme(new_theme)
         theme.apply_font(family=new_family, size=new_size)
@@ -2494,14 +2744,20 @@ class MainWindow(QMainWindow):
             )
             self._full_rebuild_list(preserve_name=cur_proj_name)
             self._rebuild_playlists_list()
+            # _full_rebuild_list reselects the visible row, which fires
+            # _on_select -> _load_detail; only reload here if the row is
+            # filtered out (so reselection didn't happen), to avoid a
+            # redundant detail load + SizeRunnable.
             if self.current_project:
-                self._load_detail(self.current_project)
+                item = self._row_items.get(self.current_project.name)
+                if item is None or item.isHidden():
+                    self._load_detail(self.current_project)
+            # Reselecting the playlist row fires _on_playlist_select ->
+            # _load_playlist_detail, so no explicit reload needed here.
             if cur_pl_id:
                 pl_item = self._playlist_items.get(cur_pl_id)
                 if pl_item is not None:
                     self.playlists_list_widget.setCurrentItem(pl_item)
-            if self.current_playlist:
-                self._load_playlist_detail(self.current_playlist)
 
         # Persist alongside other window state.
         cur = load_state()
@@ -2551,11 +2807,19 @@ def run() -> int:
         app.setWindowIcon(QIcon(str(ICON_PATH)))
 
     # Apply persisted settings BEFORE creating MainWindow so the first
-    # paint already uses the right theme + font.
+    # paint already uses the right theme + font. Guard against a corrupt or
+    # hand-edited state.json (wrong types) so the app can still launch.
     state = load_state()
-    settings = state.get("settings") or {}
-    initial_family = settings.get("font_family", theme.DEFAULT_FONT_FAMILY)
-    initial_size = int(settings.get("font_size", theme.DEFAULT_FONT_SIZE))
+    settings = state.get("settings")
+    if not isinstance(settings, dict):
+        settings = {}
+    family = settings.get("font_family")
+    initial_family = family if isinstance(family, str) and family else theme.DEFAULT_FONT_FAMILY
+    try:
+        initial_size = int(settings.get("font_size", theme.DEFAULT_FONT_SIZE))
+    except (TypeError, ValueError):
+        initial_size = theme.DEFAULT_FONT_SIZE
+    initial_size = max(theme.FONT_SIZE_MIN, min(theme.FONT_SIZE_MAX, initial_size))
     theme.apply_theme(settings.get("theme", theme.DEFAULT_THEME))
     theme.apply_font(family=initial_family, size=initial_size)
     from PySide6.QtGui import QFont
